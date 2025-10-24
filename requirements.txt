@@ -1,9 +1,4 @@
 streamlit
-pypdfform>=3.5.0
 PyMuPDF
-pandas
-Pillow
-easyocr
-opencv-python-headless
-rapidfuzz
-numpy
+requests
+PyPDFForm>=2.0.0
