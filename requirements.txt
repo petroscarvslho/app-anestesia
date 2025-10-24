@@ -1,8 +1,4 @@
-pymupdf==1.26.5
-streamlit==1.50.0
-reportlab==4.4.4
-rapidocr-onnxruntime
-pillow
-numpy
-python-dateutil
-unidecode
+streamlit
+pymupdf
+pypdfform
+reportlab
