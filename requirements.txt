@@ -1,4 +1,5 @@
 streamlit
 pymupdf
-pypdfform
-reportlab
+rapidocr-onnxruntime  # opcional; pode tirar se não quiser OCR de foto
+Pillow
+numpy
