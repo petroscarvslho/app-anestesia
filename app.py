@@ -279,7 +279,7 @@ def parse_aih(pdf_path: str) -> Dict[str, str]:
 
     result: Dict[str, str] = {}
 
-    # Ordem dos blocos (os que você relatou no vídeo/logs)
+    # Ordem dos blocos
     for fn in (
         parse_bloco_nome_atend_pront,
         parse_bloco_nome_mae_tel,
@@ -293,12 +293,10 @@ def parse_aih(pdf_path: str) -> Dict[str, str]:
                 if v and not result.get(k):  # não sobrescreve se já tem valor
                     result[k] = v
         except Exception:
-            # Fallback: não quebra o fluxo se um bloco falhar
             pass
 
-    # Pós-limpeza mínima
+    # Correção sexo x raça
     if result.get("raca") in ["MASCULINO", "FEMININO"]:
-        # às vezes sexo cai em raca; se sexo vazio e raca for sexo, corrige
         if not result.get("sexo"):
             result["sexo"] = result["raca"]
         result["raca"] = ""
