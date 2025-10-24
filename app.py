@@ -1,518 +1,400 @@
 import streamlit as st
 import fitz  # PyMuPDF
-import re, json
+import re
+import io
+import csv
+import json
+import unicodedata
 from datetime import datetime
 from PyPDFForm.wrapper import PdfWrapper
-import io
 
-# ------------------ CONFIG ------------------
 st.set_page_config(page_title="Gerador de Ficha HEMOBA", layout="wide")
 st.title("🩸 Gerador Automático de Ficha HEMOBA")
-st.markdown("Envie a **Ficha AIH (PDF)** para pré-preencher os campos marcados como 🟢 AIH. \
-Você pode editar tudo antes de gerar a ficha final.")
+st.caption("Envie a **Ficha AIH (PDF)** para pré-preencher os campos marcados como 🔵 AIH. Você pode editar tudo antes de gerar a ficha final.")
 
 HEMOBA_TEMPLATE_PATH = "modelo_hemo.pdf"
 
-# Telefones padrão por unidade/hospital (ajuste se quiser)
-HOSPITAIS = {
-    "Maternidade Frei Justo Venture": {"telefone_unidade": "75 3331-9400"},
-    "Hospital Regional da Chapada Diamantina": {"telefone_unidade": ""},  # atualize aqui se quiser padrão
+# =========================
+# 🔧 Constantes/Config
+# =========================
+# ATENÇÃO: coloque os telefones corretos aqui (pegos do Google). Por padrão deixei vazio.
+UNIDADES_SAUDE = {
+    "Maternidade Frei Justo Venture": {"telefone": ""},  # ex: "(75) 3331-9400"
+    "Hospital Regional da Chapada Diamantina": {"telefone": ""},  # ex: "(75) 3xxx-xxxx"
 }
 
-# Opções fixas
-OPCOES_SEXO = ["Feminino", "Masculino"]
-OPCOES_RACA = ["Branca", "Parda", "Preta", "Amarela", "Indígena", "Não informada"]
-OPCOES_HOSPITAL = list(HOSPITAIS.keys())
-OPCOES_MODALIDADE = ["Rotina", "Programada", "Urgência", "Emergência"]
+# campos que queremos tentar obter da AIH
+AIH_CAMPOS = [
+    "nome_paciente", "nome_genitora", "cartao_sus", "data_nascimento",
+    "sexo", "raca", "endereco_completo", "municipio_referencia",
+    "uf", "cep", "prontuario"
+]
 
-# ------------------ ESTADO ------------------
-def ensure_state():
-    if "form_values" not in st.session_state:
-        st.session_state.form_values = {
-            # Identificação
-            "nome_paciente": "",
-            "nome_genitora": "",
-            "cartao_sus": "",
-            "data_nascimento": "",
-            "sexo": "",
-            "raca_cor": "",
-            "telefone_paciente": "",
-            "identidade": "",
-            "cpf": "",
-            "prontuario": "",
+# =========================
+# 🔩 Helpers
+# =========================
+def normalizar(txt: str) -> str:
+    if not txt: return ""
+    # remove acentos e normaliza espaços
+    s = unicodedata.normalize("NFD", txt)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    return s
 
-            # Endereço
-            "endereco_completo": "",
-            "municipio_origem": "",
-            "uf": "",
-            "cep": "",
+def limpar_nome(v: str) -> str:
+    if not v: return ""
+    v = re.sub(r"[^A-Za-zÀ-ÿ\s']", " ", v).strip()
+    v = re.sub(r"\s{2,}", " ", v)
+    return v
 
-            # Estabelecimento (manuais)
-            "hospital": OPCOES_HOSPITAL[0],
-            "unidade_saude": OPCOES_HOSPITAL[0],
-            "telefone_unidade": HOSPITAIS[OPCOES_HOSPITAL[0]]["telefone_unidade"],
+def apenas_digitos(v: str) -> str:
+    return re.sub(r"\D", "", v or "")
 
-            # Emissão
-            "data": datetime.now().strftime("%d/%m/%Y"),
-            "hora": datetime.now().strftime("%H:%M"),
+def proxima_linha_nao_vazia(linhas, i):
+    j = i + 1
+    while j < len(linhas):
+        t = linhas[j].strip()
+        if t:
+            return linhas[j].strip()
+        j += 1
+    return ""
 
-            # Clínico / transfusional
-            "diagnostico": "",
-            "cid10_principal": "",
-            "cid10_secundario": "",
-            "peso": "",
-            "antecedente_transfusional": "Não",
-            "antecedentes_obstetricos": "Não",
-            "modalidade_transfusao": "Rotina",
+# =========================
+# 🧠 Extração (robusta por rótulos)
+# =========================
+ROTULOS = {
+    # rótulo -> chave destino
+    r"^nome do paciente$": "nome_paciente",
+    r"^nome da mae$": "nome_genitora",
+    r"^cns$|^cartao sus|^cartao do sus": "cartao_sus",
+    r"^data de nasc": "data_nascimento",
+    r"^sexo$": "sexo",
+    r"^raca.?/?cor$|^raca$|^cor$": "raca",
+    r"^endereco residencial .*|^endereco$|^endereco completo$": "endereco_completo",
+    r"^municipio de referencia$|^municipio de referencia$": "municipio_referencia",
+    r"^uf$": "uf",
+    r"^cep$": "cep",
+    r"^num\.? prontuario$|^n[uú]m\.? prontuario$|^prontuario$": "prontuario",
+}
 
-            # Produtos e quantidades
-            "hema": False, "qtd_hema": 0,
-            "pfc": False, "qtd_pfc": 0,
-            "plaquetas_prod": False, "qtd_plaquetas": 0,
-            "crio": False, "qtd_crio": 0,
-        }
-    if "autofilled" not in st.session_state:
-        st.session_state.autofilled = {k: False for k in st.session_state.form_values}
-    if "raw_text" not in st.session_state:
-        st.session_state.raw_text = ""
-    if "parsed" not in st.session_state:
-        st.session_state.parsed = {}
-    if "last_uploaded_name" not in st.session_state:
-        st.session_state.last_uploaded_name = None
+def parse_lines_by_labels(full_text: str):
+    res = {}
+    lines = [l.rstrip() for l in full_text.splitlines()]
+    # mapa normalizado->original para capturar corretamente mesmo com acento/deslocamento
+    norm_lines = [normalizar(l).lower() for l in lines]
 
-ensure_state()
+    # 1) varre rótulos conhecidos (valor = próxima linha não vazia)
+    for i, n in enumerate(norm_lines):
+        for pat, chave in ROTULOS.items():
+            if re.search(pat, n):
+                val = proxima_linha_nao_vazia(lines, i)  # usa a linha original como valor
+                if chave in ("nome_paciente", "nome_genitora"):
+                    val = limpar_nome(val)
+                if chave == "cartao_sus":
+                    d = apenas_digitos(val)
+                    if len(d) >= 11:
+                        val = d
+                if chave == "cep":
+                    m = re.search(r"\b\d{2}\.?\d{3}-?\d{3}\b|\b\d{5}-\d{3}\b", val)
+                    if m: val = m.group(0)
+                if chave == "uf":
+                    m = re.search(r"\b[A-Z]{2}\b", val)
+                    if m: val = m.group(0)
+                res.setdefault(chave, val)
 
-# ------------------ EXTRAÇÃO ------------------
-def norm(s):
-    return (s or "").strip()
+    # 2) heurísticas extras caso algo falhe
+    if "sexo" not in res:
+        for n, raw in zip(norm_lines, lines):
+            if "feminino" in n: res["sexo"] = "Feminino"; break
+            if "masculino" in n: res["sexo"] = "Masculino"; break
 
-def try_pick(options, value):
-    v = (value or "").strip().lower()
-    for opt in options:
-        if opt.lower().startswith(v) or v.startswith(opt.lower()):
-            return opt
-    return value or ""
+    if "raca" not in res:
+        for n, raw in zip(norm_lines, lines):
+            if "parda" in n: res["raca"] = "Parda"; break
+            if "branca" in n: res["raca"] = "Branca"; break
+            if "preta" in n: res["raca"] = "Preta"; break
+            if "amarela" in n: res["raca"] = "Amarela"; break
+            if "indigena" in n or "indígena" in raw.lower(): res["raca"] = "Indígena"; break
 
-def extract_data_pass_A(full_text):
-    t = full_text
+    # 3) ajuste de endereço: se vier CEP/UF/município separados, monta "endereco_completo" amigável
+    if "endereco_completo" not in res:
+        base = []
+        # tenta achar algo que pareça endereço solto (ex: "POV GUARIBAS, SN, ZONA RURAL")
+        for raw in lines:
+            if re.search(r"\bSN\b|\bRUA\b|\bAV\b|ZONA|BAIRRO|POV|TRAV|ALAMEDA|COND\.", raw, re.IGNORECASE):
+                base.append(raw.strip())
+        if base:
+            res["endereco_completo"] = base[0]
 
-    # padrões mais abrangentes (labels variam e pulam linha)
-    patterns = {
-        "nome_paciente": r"Nome\s+do\s+Paciente\s*\n(.+)",
-        "nome_genitora": r"Nome\s+da\s+M[ãa]e\s*\n(.+)",
+    return res
 
-        "cartao_sus": r"\bCNS\b\s*\n([\d\s\.]{11,})",
-        "data_nascimento": r"Data\s+de\s+Nasc\s*\n(\d{2}/\d{2}/\d{4})",
-        "sexo": r"\bSexo\b\s*\n([A-Za-zÀ-ÿ]+)",
-        "raca_cor": r"Ra[çc]a/?cor\s*\n([A-ZÀ-ÿ]+)",
-
-        "telefone_paciente": r"Telefone\s+Celular\s*\n([\(\)\d\-\s]+)",
-        "identidade": r"\bIdentidade\b\s*\n([\w\.\-\/]+)",
-        "cpf": r"\bCPF\b\s*\n([\d\.\-]+)",
-        "prontuario": r"N[úu]m\.?\s*Prontu[áa]rio\s*\n(\d+)",
-
-        "endereco_completo": r"Endere[çc]o\s+Residencial.*?\n(.+)",
-        "municipio_origem": r"Munic[ií]pio\s+de\s+Refer[êe]ncia\s*\n([A-ZÀ-ÿ\s\-]+)",
-        "uf": r"\bUF\b\s*\n([A-Z]{2})",
-        "cep": r"\bCEP\b\s*\n([\d\.\-]+)",
-
-        "cid10_principal": r"CID\s*[-\s]*10\s*Principal\s*\n([A-Z]\d{2}(?:\.\d{1,2})?)",
-        "cid10_secundario": r"Diagn[óo]stico\s+Secund[áa]rio\s*\n([A-Z]\d{2}(?:\.\d{1,2})?)",
-
-        # Infos do estabelecimento (apenas para log)
-        "estab_solicitante": r"Nome\s+do\s+Estabelecimento\s+Solicitante\s*\n(.+)",
-        "estab_executante": r"Nome\s+do\s+Estabelecimento\s+Executante\s*\n(.+)",
-        "cnes": r"\bCNES\b\s*\n(\d+)",
-        "cnpj": r"CNPJ:?\s*\n?([\d\./\-]+)",
-        "telefone_unidade_aih": r"Tel\s*[-:]?\s*([\d\s\-\(\)]+)",
-    }
-
-    results = {}
-    for key, pat in patterns.items():
-        m = re.search(pat, t, flags=re.IGNORECASE)
-        if m:
-            results[key] = norm(m.group(1))
-
-    # Limpezas pontuais
-    if "cartao_sus" in results:
-        results["cartao_sus"] = re.sub(r"\D", "", results["cartao_sus"])
-    if "telefone_paciente" in results:
-        tel = re.sub(r"[^\d]", "", results["telefone_paciente"])
-        if len(tel) >= 10:
-            results["telefone_paciente"] = tel
-        else:
-            results.pop("telefone_paciente", None)
-    if "cpf" in results:
-        results["cpf"] = re.sub(r"[^\d]", "", results["cpf"])
-    if "cep" in results:
-        results["cep"] = re.sub(r"[^\d]", "", results["cep"])
-
-    # Normalizações de escolhas
-    if "sexo" in results:
-        results["sexo"] = try_pick(OPCOES_SEXO, results["sexo"])
-    if "raca_cor" in results:
-        # padroniza para opções conhecidas se possível
-        m = results["raca_cor"].capitalize()
-        results["raca_cor"] = try_pick(OPCOES_RACA, m)
-
-    return results
-
-def extract_data_pass_B(page):
-    """Resgate por posição (ajuste as faixas se necessário para seu layout)."""
-    results = {}
-    blocks = page.get_text("blocks")
-    blocks.sort(key=lambda b: (b[1], b[0]))  # y, x
-
-    bands = {
-        "nome_paciente": (580, 630),
-        "nome_genitora": (500, 545),
-        "cartao_sus": (665, 710),
-        "prontuario": (725, 770),
-    }
-
-    for key, (y0, y1) in bands.items():
-        for b in blocks:
-            _, y_top, _, y_bot, text, *_ = b
-            y_center = (y_top + y_bot) / 2
-            if y0 <= y_center <= y1:
-                text = norm(text)
-                if key in ("cartao_sus", "prontuario"):
-                    digits = re.sub(r"\D", "", text)
-                    if digits:
-                        results[key] = digits
-                        break
-                else:
-                    if len(text) > 1:
-                        results[key] = text
-                        break
-    return results
-
-def extract_from_pdf(uploaded_file):
-    raw_text = ""
-    parsed = {}
-    autofilled_keys = []
-
+def extract_from_pdf(fileobj):
     try:
-        doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-        if not doc:
-            return raw_text, parsed, autofilled_keys
-
-        # Pego o texto da primeira página (ajuste se quiser concatenar todas)
-        page0 = doc[0]
-        raw_text = page0.get_text("text")
-
-        # Passagem A
-        a = extract_data_pass_A(raw_text)
-
-        # Se faltar algo crítico, tenta resgatar via posição
-        critical = ["nome_paciente", "nome_genitora", "cartao_sus", "prontuario"]
-        missing = [f for f in critical if not a.get(f)]
-        if missing:
-            b = extract_data_pass_B(page0)
-            for k in missing:
-                if b.get(k):
-                    a[k] = b[k]
-
-        parsed = a
-
-        # Calcula quais chaves serão marcadas como autofill depois
-        autofilled_keys = list(parsed.keys())
-        return raw_text, parsed, autofilled_keys
+        doc = fitz.open(stream=fileobj.read(), filetype="pdf")
+        txt = ""
+        for p in doc:
+            # usar "text" simples evita quebra de blocos estranhos
+            txt += p.get_text("text") + "\n"
+        parsed = parse_lines_by_labels(txt)
+        return txt, parsed
     except Exception as e:
-        st.error(f"Erro ao ler a AIH: {e}")
-        return raw_text, parsed, autofilled_keys
+        st.error(f"Erro ao ler o PDF: {e}")
+        return "", {}
 
-# ------------------ UI HELPERS ------------------
-def label_with_status(label, key):
-    return f"{'🟢' if st.session_state.autofilled.get(key) else '⚪'} {label}"
+# =========================
+# 🧾 Log em memória + download
+# =========================
+def append_log(entry: dict):
+    if "extraction_log" not in st.session_state:
+        st.session_state.extraction_log = []
+    st.session_state.extraction_log.append(entry)
 
-def apply_autofill(parsed_dict):
-    """Preenche st.session_state.form_values com valores extraídos e marca autofilled."""
-    for k, v in parsed_dict.items():
-        if k in st.session_state.form_values and v:
-            st.session_state.form_values[k] = v
-            st.session_state.autofilled[k] = True
+def download_buttons_for_log():
+    if "extraction_log" not in st.session_state or not st.session_state.extraction_log:
+        return
+    st.markdown("**Baixar LOG das extrações**")
+    # JSONL
+    buf_jsonl = io.StringIO()
+    for row in st.session_state.extraction_log:
+        buf_jsonl.write(json.dumps(row, ensure_ascii=False) + "\n")
+    st.download_button("⬇️ Baixar .jsonl", buf_jsonl.getvalue().encode("utf-8"), "extracoes.jsonl", "application/json")
+    # CSV
+    buf_csv = io.StringIO()
+    writer = csv.DictWriter(buf_csv, fieldnames=sorted({k for r in st.session_state.extraction_log for k in r.keys()}))
+    writer.writeheader()
+    for r in st.session_state.extraction_log:
+        writer.writerow(r)
+    st.download_button("⬇️ Baixar .csv", buf_csv.getvalue().encode("utf-8"), "extracoes.csv", "text/csv")
 
-def update_unidade_phone_if_needed():
-    sel = st.session_state.form_values.get("unidade_saude")
-    padrao = HOSPITAIS.get(sel, {}).get("telefone_unidade", "")
-    if not st.session_state.form_values.get("telefone_unidade"):
-        st.session_state.form_values["telefone_unidade"] = padrao
+# =========================
+# 🧱 Estado inicial do formulário
+# =========================
+if "form_values" not in st.session_state:
+    st.session_state.form_values = {k: "" for k in [
+        # Identificação
+        "nome_paciente", "nome_genitora", "cartao_sus", "data_nascimento", "sexo", "raca",
+        # Contato e prontuário
+        "telefone_paciente", "prontuario",
+        # Endereço
+        "endereco_completo", "municipio_referencia", "uf", "cep",
+        # Estabelecimento
+        "hospital", "unidade_saude", "telefone_unidade",
+        # Data/Hora
+        "data", "hora",
+        # Campos clínicos (manuais, exemplo)
+        "diagnostico", "peso", "antecedente_transfusional", "antecedentes_obstetricos",
+        "modalidade_transfusao"
+    ]}
+    # defaults úteis
+    st.session_state.form_values["data"] = datetime.now().strftime("%d/%m/%Y")
+    st.session_state.form_values["hora"] = datetime.now().strftime("%H:%M")
+    st.session_state.form_values["modalidade_transfusao"] = "Rotina"
+    st.session_state.form_values["antecedente_transfusional"] = "Não"
+    st.session_state.form_values["antecedentes_obstetricos"] = "Não"
+    st.session_state.aih_filled = {k: False for k in AIH_CAMPOS}
 
-# ------------------ UPLOAD + EXTRAÇÃO ------------------
+# =========================
+# 1) Upload (auto-extração)
+# =========================
 with st.container(border=True):
-    st.subheader("1) Enviar Ficha AIH (PDF)")
-    uploaded = st.file_uploader("Selecione o arquivo PDF da AIH", type="pdf", label_visibility="collapsed")
+    st.header("1) Enviar Ficha AIH (PDF)")
+    up = st.file_uploader("Arraste o PDF aqui", type="pdf", label_visibility="collapsed")
+    if up is not None and st.session_state.get("last_uploaded") != up.name:
+        with st.spinner("Lendo e extraindo..."):
+            raw_text, parsed = extract_from_pdf(up)
+            # guarda debug
+            st.session_state.last_raw_text = raw_text
+            # aplica nos campos e marca origem
+            for k in AIH_CAMPOS:
+                if k in parsed and parsed[k]:
+                    st.session_state.form_values[k] = str(parsed[k]).strip()
+                    st.session_state.aih_filled[k] = True
+            # data/hora atuais (se quiser usar da AIH, ajuste aqui)
+            st.session_state.form_values["data"] = datetime.now().strftime("%d/%m/%Y")
+            st.session_state.form_values["hora"] = datetime.now().strftime("%H:%M")
 
-    if uploaded is not None:
-        if st.session_state.last_uploaded_name != uploaded.name:
-            with st.spinner("Lendo e extraindo dados da AIH..."):
-                raw, parsed, auto_keys = extract_from_pdf(uploaded)
-                st.session_state.raw_text = raw
-                st.session_state.parsed = parsed
-                # aplica no formulário e marca campos
-                apply_autofill(parsed)
-                st.session_state.last_uploaded_name = uploaded.name
-                # exibe feedback rápido
-                st.success(f"Extração concluída. Campos AIH preenchidos: {', '.join(sorted(k for k in auto_keys if k in st.session_state.form_values)) or '-'}")
+            # log
+            append_log({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "arquivo": up.name,
+                **{k: st.session_state.form_values.get(k, "") for k in AIH_CAMPOS}
+            })
 
-# ------------------ FORMULÁRIO (sempre visível) ------------------
-st.subheader("2) Revisar e completar formulário")
+            st.session_state.last_uploaded = up.name
+            st.success("Dados extraídos! Revise e complete abaixo.")
 
-with st.form("form_hemoba", clear_on_submit=False):
-    # --- Identificação ---
-    st.markdown("### Identificação do Paciente")
+# =========================
+# 2) Revisar e completar formulário
+# =========================
+st.header("2) Revisar e completar formulário ↪")
+
+def label_aih(txt, key):
+    return f"{'🔵' if st.session_state.aih_filled.get(key) else '⚪'} {txt}"
+
+# Seção: Identificação do Paciente
+with st.form("form_hemoba"):
+    st.subheader("Identificação do Paciente")
     c1, c2 = st.columns(2)
     with c1:
         st.session_state.form_values["nome_paciente"] = st.text_input(
-            label_with_status("Nome do Paciente", "nome_paciente"),
-            value=st.session_state.form_values["nome_paciente"],
-            key="fv_nome_paciente"
+            label_aih("Nome do Paciente", "nome_paciente"),
+            value=st.session_state.form_values["nome_paciente"]
         )
         st.session_state.form_values["cartao_sus"] = st.text_input(
-            label_with_status("Cartão SUS (CNS)", "cartao_sus"),
-            value=st.session_state.form_values["cartao_sus"],
-            key="fv_cartao_sus"
+            label_aih("Cartão SUS (CNS)", "cartao_sus"),
+            value=st.session_state.form_values["cartao_sus"]
         )
-        st.session_state.form_values["sexo"] = st.selectbox(
-            label_with_status("Sexo", "sexo"),
-            OPCOES_SEXO,
-            index=(OPCOES_SEXO.index(st.session_state.form_values["sexo"]) if st.session_state.form_values["sexo"] in OPCOES_SEXO else 0),
-            key="fv_sexo"
-        )
-        st.session_state.form_values["telefone_paciente"] = st.text_input(
-            label_with_status("Telefone do Paciente", "telefone_paciente"),
-            value=st.session_state.form_values["telefone_paciente"],
-            key="fv_telefone_paciente"
+        st.session_state.form_values["sexo"] = st.text_input(
+            label_aih("Sexo", "sexo"),
+            value=st.session_state.form_values["sexo"]
         )
     with c2:
         st.session_state.form_values["nome_genitora"] = st.text_input(
-            label_with_status("Nome da Mãe", "nome_genitora"),
-            value=st.session_state.form_values["nome_genitora"],
-            key="fv_nome_genitora"
+            label_aih("Nome da Mãe", "nome_genitora"),
+            value=st.session_state.form_values["nome_genitora"]
         )
         st.session_state.form_values["data_nascimento"] = st.text_input(
-            label_with_status("Data de Nascimento (DD/MM/AAAA)", "data_nascimento"),
-            value=st.session_state.form_values["data_nascimento"],
-            key="fv_data_nascimento"
+            label_aih("Data de Nascimento (DD/MM/AAAA)", "data_nascimento"),
+            value=st.session_state.form_values["data_nascimento"]
         )
-        st.session_state.form_values["raca_cor"] = st.selectbox(
-            label_with_status("Raça/Cor", "raca_cor"),
-            OPCOES_RACA,
-            index=(OPCOES_RACA.index(st.session_state.form_values["raca_cor"]) if st.session_state.form_values["raca_cor"] in OPCOES_RACA else OPCOES_RACA.index("Não informada")),
-            key="fv_raca_cor"
-        )
-        st.session_state.form_values["prontuario"] = st.text_input(
-            label_with_status("Prontuário", "prontuario"),
-            value=st.session_state.form_values["prontuario"],
-            key="fv_prontuario"
+        st.session_state.form_values["raca"] = st.text_input(
+            label_aih("Raça/Cor", "raca"),
+            value=st.session_state.form_values["raca"]
         )
 
-    # --- Endereço ---
-    st.markdown("### Endereço")
-    st.session_state.form_values["endereco_completo"] = st.text_input(
-        label_with_status("Endereço completo", "endereco_completo"),
-        value=st.session_state.form_values["endereco_completo"],
-        key="fv_endereco_completo"
-    )
-    c3, c4, c5 = st.columns([1.2, 0.5, 0.8])
+    # Contato / Prontuário
+    c3, c4 = st.columns(2)
     with c3:
-        st.session_state.form_values["municipio_origem"] = st.text_input(
-            label_with_status("Município de referência", "municipio_origem"),
-            value=st.session_state.form_values["municipio_origem"],
-            key="fv_municipio_origem"
+        st.session_state.form_values["telefone_paciente"] = st.text_input(
+            "⚪ Telefone do Paciente",
+            value=st.session_state.form_values["telefone_paciente"]
         )
     with c4:
-        st.session_state.form_values["uf"] = st.text_input(
-            label_with_status("UF", "uf"),
-            value=st.session_state.form_values["uf"],
-            key="fv_uf"
-        )
-    with c5:
-        st.session_state.form_values["cep"] = st.text_input(
-            label_with_status("CEP", "cep"),
-            value=st.session_state.form_values["cep"],
-            key="fv_cep"
+        st.session_state.form_values["prontuario"] = st.text_input(
+            label_aih("Prontuário", "prontuario"),
+            value=st.session_state.form_values["prontuario"]
         )
 
-    # --- Estabelecimento ---
-    st.markdown("### Estabelecimento (selecione)")
-    c6, c7 = st.columns(2)
+    # Endereço
+    st.subheader("Endereço")
+    c5, c6, c7 = st.columns([3,1,1])
+    with c5:
+        st.session_state.form_values["endereco_completo"] = st.text_input(
+            label_aih("Endereço completo", "endereco_completo"),
+            value=st.session_state.form_values["endereco_completo"]
+        )
     with c6:
-        st.session_state.form_values["hospital"] = st.selectbox(
-            "⚪ Hospital",
-            OPCOES_HOSPITAL,
-            index=OPCOES_HOSPITAL.index(st.session_state.form_values["hospital"]) if st.session_state.form_values["hospital"] in OPCOES_HOSPITAL else 0,
-            key="fv_hospital"
+        st.session_state.form_values["uf"] = st.text_input(
+            label_aih("UF", "uf"),
+            value=st.session_state.form_values["uf"]
         )
     with c7:
-        st.session_state.form_values["unidade_saude"] = st.selectbox(
-            "⚪ Unidade de saúde",
-            OPCOES_HOSPITAL,
-            index=OPCOES_HOSPITAL.index(st.session_state.form_values["unidade_saude"]) if st.session_state.form_values["unidade_saude"] in OPCOES_HOSPITAL else 0,
-            key="fv_unidade_saude",
-            on_change=update_unidade_phone_if_needed
+        st.session_state.form_values["cep"] = st.text_input(
+            label_aih("CEP", "cep"),
+            value=st.session_state.form_values["cep"]
         )
-    st.session_state.form_values["telefone_unidade"] = st.text_input(
-        "⚪ Telefone da unidade (padrão pela seleção, pode editar)",
-        value=st.session_state.form_values["telefone_unidade"],
-        key="fv_telefone_unidade"
+    st.session_state.form_values["municipio_referencia"] = st.text_input(
+        label_aih("Município de referência", "municipio_referencia"),
+        value=st.session_state.form_values["municipio_referencia"]
     )
 
-    # --- Emissão ---
-    st.markdown("### Emissão")
+    # Estabelecimento (seleção manual; sem callback dentro do form)
+    st.subheader("Estabelecimento (selecione)")
+    # escolha do hospital/unidade
+    hosp_opcoes = list(UNIDADES_SAUDE.keys())
+    # Valor inicial
+    if st.session_state.form_values["hospital"] == "":
+        st.session_state.form_values["hospital"] = hosp_opcoes[0]
+    st.session_state.form_values["hospital"] = st.selectbox(
+        "🏥 Hospital / Unidade de saúde",
+        options=hosp_opcoes,
+        index=hosp_opcoes.index(st.session_state.form_values["hospital"])
+    )
+    # telefone da unidade = do dicionário, mas editável
+    tel_padrao = UNIDADES_SAUDE.get(st.session_state.form_values["hospital"], {}).get("telefone", "")
+    if st.session_state.form_values["telefone_unidade"] == "" and tel_padrao:
+        st.session_state.form_values["telefone_unidade"] = tel_padrao
+
+    st.session_state.form_values["telefone_unidade"] = st.text_input(
+        "⚪ Telefone da Unidade (padrão, pode ajustar)",
+        value=st.session_state.form_values["telefone_unidade"]
+    )
+
+    # Data/Hora (auto)
     c8, c9 = st.columns(2)
     with c8:
         st.session_state.form_values["data"] = st.text_input(
-            label_with_status("Data (emissão)", "data"),
-            value=st.session_state.form_values["data"],
-            key="fv_data"
+            "⚪ Data",
+            value=st.session_state.form_values["data"]
         )
     with c9:
         st.session_state.form_values["hora"] = st.text_input(
-            label_with_status("Hora (emissão)", "hora"),
-            value=st.session_state.form_values["hora"],
-            key="fv_hora"
+            "⚪ Hora",
+            value=st.session_state.form_values["hora"]
         )
 
-    # --- Clínico / transfusional ---
-    st.markdown("### Dados clínicos e transfusionais")
-    st.session_state.form_values["diagnostico"] = st.text_input(
-        label_with_status("Diagnóstico", "diagnostico"),
-        value=st.session_state.form_values["diagnostico"],
-        key="fv_diagnostico"
-    )
-    c10, c11, c12 = st.columns(3)
+    # Campos clínicos (exemplos manuais)
+    st.subheader("Dados clínicos (manuais)")
+    c10, c11 = st.columns(2)
     with c10:
-        st.session_state.form_values["cid10_principal"] = st.text_input(
-            label_with_status("CID-10 principal", "cid10_principal"),
-            value=st.session_state.form_values["cid10_principal"],
-            key="fv_cid10_principal"
-        )
+        st.session_state.form_values["diagnostico"] = st.text_input("⚪ Diagnóstico", value=st.session_state.form_values["diagnostico"])
+        st.session_state.form_values["antecedente_transfusional"] = st.selectbox("⚪ Antecedente Transfusional?", ["Não", "Sim"], index=0 if st.session_state.form_values["antecedente_transfusional"]!="Sim" else 1)
     with c11:
-        st.session_state.form_values["cid10_secundario"] = st.text_input(
-            label_with_status("CID-10 secundário", "cid10_secundario"),
-            value=st.session_state.form_values["cid10_secundario"],
-            key="fv_cid10_secundario"
-        )
-    with c12:
-        st.session_state.form_values["peso"] = st.text_input(
-            label_with_status("Peso (kg)", "peso"),
-            value=st.session_state.form_values["peso"],
-            key="fv_peso"
-        )
+        st.session_state.form_values["peso"] = st.text_input("⚪ Peso (kg)", value=st.session_state.form_values["peso"])
+        st.session_state.form_values["antecedentes_obstetricos"] = st.selectbox("⚪ Antecedentes Obstétricos?", ["Não", "Sim"], index=0 if st.session_state.form_values["antecedentes_obstetricos"]!="Sim" else 1)
 
-    c13, c14, c15 = st.columns(3)
-    with c13:
-        st.session_state.form_values["antecedente_transfusional"] = st.selectbox(
-            label_with_status("Antecedente transfusional?", "antecedente_transfusional"),
-            ["Não", "Sim"],
-            index=0 if st.session_state.form_values["antecedente_transfusional"] != "Sim" else 1,
-            key="fv_antecedente_transfusional"
-        )
-    with c14:
-        st.session_state.form_values["antecedentes_obstetricos"] = st.selectbox(
-            label_with_status("Antecedentes obstétricos?", "antecedentes_obstetricos"),
-            ["Não", "Sim"],
-            index=0 if st.session_state.form_values["antecedentes_obstetricos"] != "Sim" else 1,
-            key="fv_antecedentes_obstetricos"
-        )
-    with c15:
-        st.session_state.form_values["modalidade_transfusao"] = st.selectbox(
-            label_with_status("Modalidade de transfusão", "modalidade_transfusao"),
-            OPCOES_MODALIDADE,
-            index=OPCOES_MODALIDADE.index(st.session_state.form_values["modalidade_transfusao"]) if st.session_state.form_values["modalidade_transfusao"] in OPCOES_MODALIDADE else 0,
-            key="fv_modalidade_transfusao"
-        )
+    st.session_state.form_values["modalidade_transfusao"] = st.selectbox(
+        "⚪ Modalidade de Transfusão", ["Rotina", "Programada", "Urgência", "Emergência"],
+        index=["Rotina","Programada","Urgência","Emergência"].index(st.session_state.form_values["modalidade_transfusao"])
+    )
 
-    st.markdown("### Produtos e quantidades")
-    c16, c17 = st.columns(2)
-    with c16:
-        st.session_state.form_values["hema"] = st.checkbox(
-            "Hemácias", value=st.session_state.form_values["hema"], key="fv_hema"
-        )
-        st.session_state.form_values["qtd_hema"] = st.number_input(
-            "Quantidade de Hemácias", min_value=0, step=1, value=int(st.session_state.form_values["qtd_hema"]), key="fv_qtd_hema"
-        )
-        st.session_state.form_values["pfc"] = st.checkbox(
-            "PFC", value=st.session_state.form_values["pfc"], key="fv_pfc"
-        )
-        st.session_state.form_values["qtd_pfc"] = st.number_input(
-            "Quantidade de PFC", min_value=0, step=1, value=int(st.session_state.form_values["qtd_pfc"]), key="fv_qtd_pfc"
-        )
-    with c17:
-        st.session_state.form_values["plaquetas_prod"] = st.checkbox(
-            "Plaquetas", value=st.session_state.form_values["plaquetas_prod"], key="fv_plaquetas"
-        )
-        st.session_state.form_values["qtd_plaquetas"] = st.number_input(
-            "Quantidade de Plaquetas", min_value=0, step=1, value=int(st.session_state.form_values["qtd_plaquetas"]), key="fv_qtd_plaquetas"
-        )
-        st.session_state.form_values["crio"] = st.checkbox(
-            "Crioprecipitado", value=st.session_state.form_values["crio"], key="fv_crio"
-        )
-        st.session_state.form_values["qtd_crio"] = st.number_input(
-            "Quantidade de Crioprecipitado", min_value=0, step=1, value=int(st.session_state.form_values["qtd_crio"]), key="fv_qtd_crio"
-        )
-
-    # --- Ações ---
-    cA, cB = st.columns([0.5, 0.5])
-    with cA:
-        gerar = st.form_submit_button("✔️ Gerar PDF Final", type="primary")
-    with cB:
-        # só para forçar um "reset" visual do selo AIH se você quiser
-        limpar_aih = st.form_submit_button("Limpar selos AIH (manter valores)")
-
-    if limpar_aih:
-        st.session_state.autofilled = {k: False for k in st.session_state.form_values}
-
-    if gerar:
-        # monta payload para o PDF
-        data = dict(st.session_state.form_values)
+    submitted = st.form_submit_button("Gerar PDF Final", type="primary")
+    if submitted:
         try:
-            pdf_form = PdfWrapper(HEMOBA_TEMPLATE_PATH)
-            # Mapas de booleanos e modalidade (se o seu PDF usar nomes diferentes, ajuste aqui)
-            for field in ["antecedente_transfusional", "antecedentes_obstetricos"]:
-                sel = data.get(field, "Não")
-                data[f"{field}s"] = (sel == "Sim")
-                data[f"{field}n"] = (sel != "Sim")
+            pdf = PdfWrapper(HEMOBA_TEMPLATE_PATH)
+            payload = {k: ("" if v is None else str(v)) for k, v in st.session_state.form_values.items()}
+
+            # Exemplo de mapeamento de radios/checkboxes se existir no seu PDF:
+            # (ajuste os nomes dos campos do seu template)
+            for field in ['antecedente_transfusional', 'antecedentes_obstetricos']:
+                sel = st.session_state.form_values.get(field, "Não")
+                payload[f'{field}s'] = (sel == 'Sim')
+                payload[f'{field}n'] = (sel == 'Não')
 
             modalidades = {
                 "Programada": "modalidade_transfusaop",
                 "Rotina": "modalidade_transfusaor",
                 "Urgência": "modalidade_transfusaou",
-                "Emergência": "modalidade_transfusaoe",
+                "Emergência": "modalidade_transfusaoe"
             }
-            selected = data.get("modalidade_transfusao")
-            for nome, campo in modalidades.items():
-                data[campo] = (nome == selected)
+            sel_mod = st.session_state.form_values.get("modalidade_transfusao", "Rotina")
+            for k, fld in modalidades.items():
+                payload[fld] = (k == sel_mod)
 
-            # checkboxes de produtos já estão em data; quantidades também
-            pdf_form.fill({k: str(v) for k, v in data.items()}, flatten=False)
-            out = pdf_form.read()
+            pdf.fill(payload, flatten=False)
+            data_bytes = pdf.read()
 
             st.success("PDF gerado com sucesso!")
             st.download_button(
-                "Baixar Ficha HEMOBA",
-                data=out,
-                file_name=f"HEMOBA_{(data.get('nome_paciente') or 'paciente').replace(' ', '_')}.pdf",
-                mime="application/pdf",
+                "⬇️ Baixar Ficha HEMOBA",
+                data=data_bytes,
+                file_name=f"HEMOBA_{st.session_state.form_values.get('nome_paciente','paciente').replace(' ','_')}.pdf",
+                mime="application/pdf"
             )
         except Exception as e:
-            st.error(f"Erro ao preencher o PDF: {e}")
+            st.error(f"Erro ao preencher PDF: {e}")
 
-# ------------------ LOGS ------------------
-with st.expander("📜 Logs da extração (texto bruto e JSON)"):
-    st.caption("Texto bruto extraído da AIH (primeira página):")
-    st.text(st.session_state.raw_text or "(vazio)")
-    st.caption("Campos parseados:")
-    st.json(st.session_state.parsed or {})
+# =========================
+# 🧪 Debug / Logs
+# =========================
+with st.expander("🪵 Ver texto extraído e pares (debug)"):
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("**Texto bruto**")
+        st.text_area("raw", st.session_state.get("last_raw_text", ""), height=260, label_visibility="collapsed")
+    with colB:
+        st.markdown("**Pares chave→valor parseados (AIH)**")
+        parsed_now = {k: st.session_state.form_values.get(k, "") for k in AIH_CAMPOS}
+        st.json(parsed_now)
 
-    # Downloads
-    raw_bytes = (st.session_state.raw_text or "").encode("utf-8")
-    json_bytes = json.dumps(st.session_state.parsed or {}, ensure_ascii=False, indent=2).encode("utf-8")
-
-    cdl1, cdl2 = st.columns(2)
-    with cdl1:
-        st.download_button("⬇️ Baixar log_extracao.txt", data=raw_bytes, file_name="log_extracao.txt", mime="text/plain")
-    with cdl2:
-        st.download_button("⬇️ Baixar extracao.json", data=json_bytes, file_name="extracao.json", mime="application/json")
+download_buttons_for_log()
