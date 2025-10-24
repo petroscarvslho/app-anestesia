@@ -108,7 +108,6 @@ def extract_data_from_aih(pdf_stream):
         results['data'] = datetime.now().strftime('%Y-%m-%d')
         results['hora'] = datetime.now().strftime('%H:%M')
 
-        st.success("Extração finalizada.")
         return results
     except Exception as e:
         st.error(f"Erro fatal ao processar PDF: {e}")
@@ -142,7 +141,7 @@ def fill_hemoba_pdf(template_path, data):
         st.error(f"Erro ao preencher PDF: {e}"); raise
 
 # ==============================================================================
-# 4. INTERFACE DO APLICATIVO (STREAMLIT)
+# 4. INTERFACE DO APLICATIVO (STREAMLIT) - VERSÃO CORRIGIDA
 # ==============================================================================
 
 # Inicializa o estado da sessão para guardar os dados
@@ -152,11 +151,25 @@ if 'form_data' not in st.session_state:
 # --- Seção de Upload ---
 with st.container(border=True):
     st.header("1. Enviar Ficha AIH")
-    uploaded_file = st.file_uploader("Selecione o arquivo PDF da AIH", type="pdf", label_visibility="collapsed")
+    uploaded_file = st.file_uploader(
+        "Selecione o arquivo PDF da AIH", 
+        type="pdf", 
+        label_visibility="collapsed"
+    )
+
+    # LÓGICA CORRIGIDA: A extração acontece automaticamente após o upload
     if uploaded_file is not None:
-        if st.button("Extrair Dados da AIH", type="primary"):
-            with st.spinner('Lendo AIH...'):
+        # Para evitar reprocessar o mesmo arquivo, checamos se ele já foi processado
+        if st.session_state.get('last_uploaded_name') != uploaded_file.name:
+            with st.spinner('Lendo a AIH...'):
                 st.session_state.form_data = extract_data_from_aih(uploaded_file)
+                st.session_state['last_uploaded_name'] = uploaded_file.name # Guarda o nome do arquivo
+                if st.session_state.form_data:
+                    st.success("Dados extraídos com sucesso! Revise e complete abaixo.")
+                else:
+                    st.error("Não foi possível extrair dados. Verifique o PDF.")
+                # Força o recarregamento da página para mostrar o formulário
+                st.rerun()
 
 # --- Seção do Formulário de Revisão ---
 if st.session_state.form_data:
@@ -204,4 +217,5 @@ if st.session_state.form_data:
                         mime="application/pdf"
                     )
                 except:
+                    # O erro já é mostrado dentro da função fill_hemoba_pdf
                     pass
