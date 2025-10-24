@@ -1,409 +1,350 @@
-import io
+# app.py — Parser AIH por colunas (PyMuPDF) + UI Streamlit opcional
+# -----------------------------------------------------------------------------
+# Uso:
+#   CLI......: python3 app.py /caminho/arquivo.pdf
+#   Streamlit: streamlit run app.py
+# -----------------------------------------------------------------------------
+
 import re
-from datetime import datetime, date, time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple, Dict
+from dataclasses import dataclass
 
-import streamlit as st
-
-# PDF
 import fitz  # PyMuPDF
+from unidecode import unidecode
 
-# ======================================================
-# CONFIG (mobile-first) + CSS leve
-# ======================================================
-st.set_page_config(page_title="Gerador de Ficha HEMOBA", layout="centered")
-st.markdown(
-    """
-    <style>
-      .block-container {max-width: 760px !important; padding-top: 1rem;}
-      h1,h2 { letter-spacing:-.3px }
-      .badge{display:inline-flex;gap:.4rem;align-items:center;padding:.15rem .5rem;border:1px solid #dbeafe;background:#eef2ff;border-radius:999px;font-size:.8rem}
-      .dot{width:.55rem;height:.55rem;border-radius:50%}
-      .aih{background:#3b82f6}.ocr{background:#22c55e}.man{background:#94a3b8}
-      .stTextInput input, .stTextArea textarea { font-size:16px !important } /* evita zoom iOS */
-      [data-testid="stHorizontalBlock"] { row-gap:.4rem }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# =========================
+# Helpers de normalização
+# =========================
 
-# ======================================================
-# TABELAS/CONSTANTES
-# ======================================================
-HOSPITAIS = {
-    "Maternidade Frei Justo Venture": "(75) 3331-9400",
-    "Hospital Regional da Chapada Diamantina": "(75) 3331-9900",
-}
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-# ======================================================
-# HELPERS DE LIMPEZA / PARSE
-# ======================================================
-def limpar_nome(txt: str) -> str:
-    if not txt:
-        return ""
-    partes = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s'.-]+", txt)
-    val = " ".join(partes).strip()
-    return re.sub(r"\s+", " ", val)
+def up_noacc(s: str) -> str:
+    return norm_space(unidecode(s or "").upper())
 
-def so_digitos(txt: str) -> str:
-    return re.sub(r"\D", "", txt or "")
+def only_digits(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
 
-def normaliza_data(txt: str) -> str:
-    if not txt:
-        return ""
-    m = re.search(r"(\d{2})[^\d]?(\d{2})[^\d]?(\d{4})", txt)
-    if not m:
-        return ""
-    d, mth, y = m.groups()
-    return f"{d}/{mth}/{y}"
+def normalize_cep(s: str) -> str:
+    d = only_digits(s)
+    if len(d) >= 8:
+        d = d[:8]
+        return f"{d[:5]}-{d[5:]}"
+    m = re.search(r"\b(\d{5})[- ]?(\d{3})\b", s or "")
+    return f"{m.group(1)}-{m.group(2)}" if m else norm_space(s)
 
-def parece_rotulo(linha: str) -> bool:
-    chk = (linha or "").lower()
-    chaves = [
-        "nome do paciente", "nome da mãe", "nome da genitora",
-        "cns", "cartão sus", "data de nasc", "sexo",
-        "raça", "raça/cor", "telefone", "telefone de contato",
-        "nº. prontuário", "nº prontuário", "prontuário",
-        "endereço residencial", "endereço completo",
-        "município de referência", "município de referencia",
-        "uf", "cep",
-    ]
-    return any(k in chk for k in chaves)
+def normalize_uf(s: str) -> str:
+    t = up_noacc(s)
+    m = re.search(r"\b([A-Z]{2})\b", t)
+    return m.group(1) if m else ""
 
-def pick_after(lines, label, max_ahead=3, prefer_digits=False, prefer_date=False):
-    lbl = label.lower()
+def normalize_sexo(s: str) -> str:
+    t = up_noacc(s)
+    if "MASC" in t: return "MASCULINO"
+    if "FEM" in t:  return "FEMININO"
+    return norm_space(s)
+
+def normalize_raca(s: str) -> str:
+    t = up_noacc(s)
+    for k in ["BRANCA", "PARDA", "PRETA", "AMARELA", "INDIGENA", "INDÍGENA"]:
+        if k in t: return "INDIGENA" if "Í" in k or "I" else k
+    return norm_space(s)
+
+def normalize_cns(s: str) -> str:
+    d = only_digits(s)
+    if len(d) >= 15:
+        return d[:15]
+    return d or norm_space(s)
+
+def normalize_date(text: str) -> str:
+    text = text or ""
+    m = re.search(r"\b(\d{2})[./-](\d{2})[./-](\d{2,4})\b", text)
+    if m:
+        d, mm, y = m.groups()
+        y = y if len(y) == 4 else ("20"+y if int(y) < 50 else "19"+y)
+        return f"{d}/{mm}/{y}"
+    digs = only_digits(text)
+    for i in range(len(digs)-7):
+        d, mm, y = digs[i:i+2], digs[i+2:i+4], digs[i+4:i+8]
+        try:
+            datetime(int(y), int(mm), int(d))
+            return f"{d}/{mm}/{y}"
+        except Exception:
+            pass
+    return norm_space(text)
+
+# =========================
+# Estruturas de dados
+# =========================
+
+@dataclass
+class Word:
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    text: str
+
+Line = List[Word]
+
+# =========================
+# Leitura e agrupamento
+# =========================
+
+def page_words(page) -> List[Word]:
+    """Obtém palavras com coords (compatível PyMuPDF 1.26.x)."""
+    out = []
+    for w in page.get_text("words"):
+        x0, y0, x1, y1, txt = w[:5]
+        if txt and txt.strip():
+            out.append(Word(float(x0), float(y0), float(x1), float(y1), txt))
+    return out
+
+def group_lines(words: List[Word], y_tol: float = 2.8) -> List[Line]:
+    """Agrupa por Y aproximado com tolerância."""
+    words = sorted(words, key=lambda w: (w.y0, w.x0))
+    lines: List[Line] = []
+    for w in words:
+        if not lines:
+            lines.append([w]); continue
+        last_y = sum(x.y0 for x in lines[-1]) / len(lines[-1])
+        if abs(w.y0 - last_y) <= y_tol:
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    for ln in lines:
+        ln.sort(key=lambda w: w.x0)
+    return lines
+
+def line_text(line: Line) -> str:
+    return norm_space(" ".join(w.text for w in line))
+
+# =========================
+# Cabeçalhos → colunas (janelas X)
+# =========================
+
+def find_header_line(lines: List[Line], required_keywords: List[str]) -> int:
+    """Retorna índice da melhor linha-cabeçalho contendo a maioria dos tokens."""
+    req = [up_noacc(k) for k in required_keywords]
+    best_idx, best_hits = -1, -1
     for i, ln in enumerate(lines):
-        if lbl in ln.lower():
-            # mesmo ln após ':'
-            if ":" in ln:
-                same = ln.split(":", 1)[1].strip()
-                if same and not parece_rotulo(same):
-                    cand = same
-                else:
-                    cand = None
-            else:
-                cand = None
-            # próximas linhas
-            if not cand:
-                for j in range(1, max_ahead + 1):
-                    if i + j >= len(lines):
-                        break
-                    cand = lines[i + j].strip()
-                    if not cand or parece_rotulo(cand):
-                        cand = None
-                        continue
-                    break
-            if not cand:
-                continue
+        txt = up_noacc(line_text(ln))
+        hits = sum(1 for k in req if k in txt)
+        if hits > best_hits:
+            best_hits, best_idx = hits, i
+    return best_idx if best_hits >= max(1, len(required_keywords)//2) else -1
 
-            if prefer_digits:
-                dig = so_digitos(cand)
-                if len(dig) >= 6:
-                    return dig
-            if prefer_date:
-                dd = normaliza_data(cand)
-                if dd:
-                    return dd
-            return cand
-    return ""
+def build_columns_from_header(line: Line, label_map: Dict[str, List[str]]) -> List[Tuple[float, float, str]]:
+    """Cria faixas (x0,x1,label) a partir das palavras do cabeçalho."""
+    anchors = []
+    for col_name, tokens in label_map.items():
+        min_x = None
+        for w in line:
+            uw = up_noacc(w.text)
+            if any(t in uw for t in tokens):
+                min_x = w.x0 if min_x is None else min(min_x, w.x0)
+        if min_x is not None:
+            anchors.append((min_x, col_name))
+    anchors.sort(key=lambda t: t[0])
+    cols = []
+    for idx, (x, name) in enumerate(anchors):
+        left  = (anchors[idx-1][0] + x)/2 if idx > 0 else x - 5
+        right = (x + anchors[idx+1][0])/2 if idx < len(anchors)-1 else x + 1200
+        cols.append((left, right, name))
+    return cols
 
-def parse_aih_from_text(lines):
-    data = {
-        # identificação
-        "nome_paciente": "", "nome_genitora": "", "cartao_sus": "",
-        "data_nascimento": "", "sexo": "", "raca": "",
-        "telefone_paciente": "", "prontuario": "",
-        # endereço
-        "endereco_completo": "", "municipio_referencia": "", "uf": "", "cep": "",
-        # estabelecimento
-        "hospital": "Maternidade Frei Justo Venture",
-        "telefone_unidade": HOSPITAIS["Maternidade Frei Justo Venture"],
-        # tempo e clínicos
-        "data": date.today(),
-        "hora": datetime.now().time().replace(microsecond=0),
-        "diagnostico": "", "peso": "",
-        "antecedente_transfusional": "Não",
-        "antecedentes_obstetricos": "Não",
-        "modalidade_transfusao": "Rotina",
+def assign_values_to_columns(value_line: Line, cols: List[Tuple[float,float,str]]) -> Dict[str, str]:
+    out = {name: "" for *_ , name in cols}
+    for w in value_line:
+        cx = (w.x0 + w.x1)/2
+        for left, right, name in cols:
+            if left <= cx <= right:
+                out[name] = norm_space(out[name] + " " + w.text)
+                break
+    return out
+
+# =========================
+# Parsers dos blocos
+# =========================
+
+def parse_bloco_nome_atend_pront(lines: List[Line]) -> Dict[str, str]:
+    # Ex.: "Nome do Paciente  Atendimento Núm.  Prontuário"
+    idx = find_header_line(lines, ["NOME", "PACIENTE", "ATEND", "PRONT"])
+    if idx < 0 or idx+1 >= len(lines):
+        return {}
+    header = lines[idx]
+    values = lines[idx+1]
+    label_map = {
+        "nome_paciente": ["NOME", "PACIENTE"],
+        "atendimento_num": ["ATEND"],
+        "prontuario": ["PRONT"],
+    }
+    cols = build_columns_from_header(header, label_map)
+    raw = assign_values_to_columns(values, cols)
+    return {
+        "nome_paciente": up_noacc(raw.get("nome_paciente", "")),
+        "atendimento_num": norm_space(raw.get("atendimento_num", "")),
+        "prontuario": norm_space(only_digits(raw.get("prontuario", "")) or raw.get("prontuario", "")),
     }
 
-    data["nome_paciente"]   = limpar_nome(pick_after(lines, "Nome do Paciente"))
-    data["nome_genitora"]   = limpar_nome(pick_after(lines, "Nome da Mãe") or pick_after(lines, "Nome da Genitora"))
-    data["cartao_sus"]      = so_digitos(pick_after(lines, "CNS", prefer_digits=True) or pick_after(lines, "Cartão SUS", prefer_digits=True))
-    data["data_nascimento"] = normaliza_data(pick_after(lines, "Data de Nasc", prefer_date=True))
+def parse_bloco_nome_mae_tel(lines: List[Line]) -> Dict[str, str]:
+    # Ex.: "Nome da Mãe   Nome do Responsável   Telefone Celular"
+    idx = find_header_line(lines, ["NOME", "MAE", "MÃE", "TELEFONE"])
+    if idx < 0 or idx+1 >= len(lines):
+        return {}
+    header = lines[idx]
+    values = lines[idx+1]
+    label_map = {
+        "nome_genitora": ["MAE", "MÃE"],
+        "responsavel": ["RESPONS"],
+        "telefone": ["TELEFONE", "CELULAR", "CONTATO"],
+    }
+    cols = build_columns_from_header(header, label_map)
+    raw = assign_values_to_columns(values, cols)
+    telefone = raw.get("telefone", "")
+    return {
+        "nome_genitora": up_noacc(raw.get("nome_genitora", "")),
+        "telefone_paciente": norm_space(telefone),
+    }
 
-    sx = (pick_after(lines, "Sexo") or "").lower()
-    data["sexo"] = "Feminino" if "fem" in sx else ("Masculino" if "mas" in sx else "")
+def parse_bloco_cns_data_sexo_raca_tel(lines: List[Line]) -> Dict[str, str]:
+    # Ex.: "CNS  Data de Nasc  Sexo  Raça/cor  Telefone de Contato"
+    idx = find_header_line(lines, ["CNS", "DATA", "SEXO", "RACA", "COR", "TELEFONE"])
+    if idx < 0 or idx+1 >= len(lines):
+        return {}
+    header = lines[idx]
+    values = lines[idx+1]
+    label_map = {
+        "cns": ["CNS"],
+        "data_nasc": ["DATA", "NASC"],
+        "sexo": ["SEXO"],
+        "raca": ["RACA", "COR"],
+        "telefone": ["TELEFONE"],
+    }
+    cols = build_columns_from_header(header, label_map)
+    raw = assign_values_to_columns(values, cols)
+    return {
+        "cns": normalize_cns(raw.get("cns", "")),
+        "data_nascimento": normalize_date(raw.get("data_nasc", "")),
+        "sexo": normalize_sexo(raw.get("sexo", "")),
+        "raca": normalize_raca(raw.get("raca", "")),
+        "telefone_paciente": norm_space(raw.get("telefone", "")),
+    }
 
-    rc = pick_after(lines, "Raça/Cor") or pick_after(lines, "Raça") or ""
-    data["raca"] = limpar_nome(rc).upper()
+def parse_bloco_endereco(lines: List[Line]) -> Dict[str, str]:
+    # Ex.: linha com "Endereço" e, na linha seguinte, o texto do endereço
+    idx = find_header_line(lines, ["ENDEREC"])
+    if idx < 0 or idx+1 >= len(lines):
+        return {}
+    valores = lines[idx+1]
+    return {"endereco_completo": norm_space(line_text(valores))}
 
-    tel = pick_after(lines, "Telefone", prefer_digits=True) or pick_after(lines, "Telefone de Contato", prefer_digits=True)
-    tel = so_digitos(tel)
-    if len(tel) >= 10:
-        tel = re.sub(r"^(\d{2})(\d{4,5})(\d{4}).*$", r"(\1) \2-\3", tel)
-    data["telefone_paciente"] = tel
+def parse_bloco_cpf_mun_uf_cep_nat(lines: List[Line]) -> Dict[str, str]:
+    # Ex.: "CPF  Municipio de Referência  Cód. IBGE do Município  UF  CEP  Naturalidade"
+    idx = find_header_line(lines, ["CPF", "MUNIC", "UF", "CEP"])
+    if idx < 0 or idx+1 >= len(lines):
+        return {}
+    header = lines[idx]
+    values = lines[idx+1]
+    label_map = {
+        "cpf": ["CPF"],
+        "municipio": ["MUNIC"],
+        "cod_ibge": ["IBGE"],
+        "uf": ["UF"],
+        "cep": ["CEP"],
+        "naturalidade": ["NATUR"],
+    }
+    cols = build_columns_from_header(header, label_map)
+    raw = assign_values_to_columns(values, cols)
+    return {
+        "cpf": norm_space(raw.get("cpf", "")),
+        "municipio": up_noacc(raw.get("municipio", "")),
+        "cod_ibge_municipio": norm_space(raw.get("cod_ibge", "")),
+        "uf": normalize_uf(raw.get("uf", "")),
+        "cep": normalize_cep(raw.get("cep", "")),
+        "naturalidade": up_noacc(raw.get("naturalidade", "")),
+    }
 
-    data["prontuario"] = so_digitos(pick_after(lines, "Prontuário", prefer_digits=True))
+# =========================
+# Parser principal
+# =========================
 
-    data["municipio_referencia"] = limpar_nome(pick_after(lines, "Município de Referência") or
-                                               pick_after(lines, "Município de Referencia"))
-    data["uf"] = (pick_after(lines, "UF") or "")[:2].upper()
-
-    cep = so_digitos(pick_after(lines, "CEP", prefer_digits=True))
-    data["cep"] = cep[:8] if len(cep) >= 8 else ""
-
-    end = pick_after(lines, "Endereço Residencial") or pick_after(lines, "Endereço completo")
-    data["endereco_completo"] = end
-
-    return data
-
-# ======================================================
-# PDF -> TEXTO (PyMuPDF)  (sem OCR)
-# ======================================================
-def get_page_lines(pdf_bytes: bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+def parse_aih(pdf_path: str) -> Dict[str, str]:
+    doc = fitz.open(pdf_path)
     page = doc[0]
-    raw = page.get_text("text")
-    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in raw.splitlines()]
-    lines = [ln for ln in lines if ln]
-    return lines, raw
+    words = page_words(page)
+    lines = group_lines(words, y_tol=3.0)
 
-def extract_from_pdf(file):
-    pdf_bytes = file.read()
-    lines, raw = get_page_lines(pdf_bytes)
-    parsed = parse_aih_from_text(lines)
-    return parsed, raw
+    result: Dict[str, str] = {}
 
-# ======================================================
-# OCR OPCIONAL (leve). Se não existir, não quebra.
-# ======================================================
-def try_rapid_ocr(image_bytes: bytes):
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        import numpy as np
-        from PIL import Image
+    # Ordem dos blocos (os que você relatou no vídeo/logs)
+    for fn in (
+        parse_bloco_nome_atend_pront,
+        parse_bloco_nome_mae_tel,
+        parse_bloco_cns_data_sexo_raca_tel,
+        parse_bloco_endereco,
+        parse_bloco_cpf_mun_uf_cep_nat,
+    ):
+        try:
+            data = fn(lines)
+            for k, v in data.items():
+                if v and not result.get(k):  # não sobrescreve se já tem valor
+                    result[k] = v
+        except Exception:
+            # Fallback: não quebra o fluxo se um bloco falhar
+            pass
 
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        arr = np.array(img)
-        ocr = RapidOCR()  # modelos embutidos no pacote
-        result, _ = ocr(arr)
-        txt = "\n".join([r[1] for r in result]) if result else ""
-        lines = [re.sub(r"\s+", " ", ln.strip()) for ln in txt.splitlines()]
-        lines = [ln for ln in lines if ln]
-        return parse_aih_from_text(lines), txt
-    except Exception as e:
-        return {}, f"[OCR indisponível]: {e}"
+    # Pós-limpeza mínima
+    if result.get("raca") in ["MASCULINO", "FEMININO"]:
+        # às vezes sexo cai em raca; se sexo vazio e raca for sexo, corrige
+        if not result.get("sexo"):
+            result["sexo"] = result["raca"]
+        result["raca"] = ""
 
-def extract_from_image(file, usar_ocr: bool):
-    b = file.read()
-    if not usar_ocr:
-        # sem OCR: apenas “texto colado” (abaixo) ou manual
-        return {}, ""
-    return try_rapid_ocr(b)
+    return result
 
-# ======================================================
-# ESTADO INICIAL (NADA DE KeyError)
-# ======================================================
-DEFAULTS = {
-    "nome_paciente": "", "nome_genitora": "", "cartao_sus": "", "data_nascimento": "",
-    "sexo": "", "raca": "", "telefone_paciente": "", "prontuario": "",
-    "endereco_completo": "", "municipio_referencia": "", "uf": "", "cep": "",
-    "hospital": "Maternidade Frei Justo Venture",
-    "telefone_unidade": HOSPITAIS["Maternidade Frei Justo Venture"],
-    "data": date.today(),
-    "hora": datetime.now().time().replace(microsecond=0),
-    "diagnostico": "", "peso": "",
-    "antecedente_transfusional": "Não",
-    "antecedentes_obstetricos": "Não",
-    "modalidade_transfusao": "Rotina",
-}
-if "dados" not in st.session_state:
-    st.session_state.dados = DEFAULTS.copy()
-if "origem" not in st.session_state:
-    st.session_state.origem = {k: "MAN" for k in DEFAULTS}
-if "raw_text" not in st.session_state:
-    st.session_state.raw_text = ""
+# =========================
+# CLI simples
+# =========================
 
-def mark_origin_update(parsed: dict, origem: str):
-    for k, v in parsed.items():
-        if v not in (None, "", []):
-            st.session_state.dados[k] = v
-            st.session_state.origem[k] = origem
+def _cli():
+    import json, sys
+    if len(sys.argv) == 2:
+        data = parse_aih(sys.argv[1])
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    # sem argumento: tenta a pasta padrão /home/ubuntu/upload
+    base = Path("/home/ubuntu/upload")
+    if not base.exists():
+        print("Uso: python3 app.py /caminho/AIH.pdf")
+        return
+    for pdf in sorted(base.glob("*.PDF")) + sorted(base.glob("*.pdf")):
+        d = parse_aih(str(pdf))
+        print(f"\n=== {pdf.name} ===")
+        print(json.dumps(d, ensure_ascii=False, indent=2))
 
-# ======================================================
-# UI
-# ======================================================
-st.title("🩸 Gerador Automático de Ficha HEMOBA")
-st.caption(
-    'Envie **PDF da AIH** (preferível) ou **Foto**. Se a foto não reconhecer, cole o texto detectado abaixo e eu preencho igual. '
-    'Origem dos dados: '
-    '<span class="badge"><span class="dot aih"></span>AIH</span> '
-    '<span class="badge"><span class="dot ocr"></span>OCR</span> '
-    '<span class="badge"><span class="dot man"></span>Manual</span>',
-    unsafe_allow_html=True,
-)
+# =========================
+# UI (Streamlit) — chamado só quando precisa
+# =========================
 
-# ---------- Upload ----------
-st.subheader("1) Enviar arquivo")
-col1, col2 = st.columns([1,1])
-with col1:
-    up = st.file_uploader(
-        "PDF (AIH) ou imagem (JPG/PNG)",
-        type=["pdf", "jpg", "jpeg", "png"],
-        label_visibility="collapsed",
-        accept_multiple_files=False,
-    )
-with col2:
-    usar_ocr = st.toggle("Tentar OCR para fotos?", value=False, help="Desmarcado = sem OCR (recomendado para deixar leve).")
+def run_streamlit_app():
+    import streamlit as st
+    st.set_page_config(page_title="HEMOBA • Extração AIH por Colunas", layout="centered")
+    st.title("HEMOBA • Extração AIH (PDF) por Colunas")
+    up = st.file_uploader("Envie um PDF AIH", type=["pdf"])
+    if up:
+        tmp = Path("tmp_aih.pdf")
+        tmp.write_bytes(up.read())
+        with st.spinner("Processando..."):
+            data = parse_aih(str(tmp))
+        st.success("Extração concluída.")
+        st.json(data)
 
-if up is not None:
-    nome = up.name.lower()
-    if nome.endswith(".pdf"):
-        parsed, raw_txt = extract_from_pdf(up)
-        mark_origin_update(parsed, "AIH")
-        st.success("AIH lida. Campos preenchidos onde possível.")
-        st.session_state.raw_text = raw_txt
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        _cli()
     else:
-        parsed, raw_txt = extract_from_image(up, usar_ocr)
-        if parsed:
-            mark_origin_update(parsed, "OCR")
-            st.success("Foto reconhecida via OCR. Revise os campos.")
-        else:
-            st.warning("Não extraí nada da foto. Você pode colar o texto abaixo e eu preencho.")
-        st.session_state.raw_text = raw_txt or st.session_state.raw_text
-
-# ---------- Plano B: colar texto e parsear ----------
-with st.expander("📋 Ou cole aqui o texto (de Live Text / Google Lens / scanner com OCR)"):
-    texto = st.text_area("Texto da AIH (colar)", value="", height=180, placeholder="Cole aqui…")
-    if st.button("Preencher a partir do texto colado"):
-        linhas = [re.sub(r"\s+", " ", ln.strip()) for ln in (texto or "").splitlines()]
-        linhas = [ln for ln in linhas if ln]
-        parsed = parse_aih_from_text(linhas)
-        mark_origin_update(parsed, "AIH")
-        st.session_state.raw_text = texto
-        st.success("Texto interpretado e campos atualizados.")
-
-st.subheader("2) Revisar e completar")
-
-def badgez(key):
-    o = st.session_state.origem.get(key, "MAN")
-    if o == "AIH":
-        return "AIH"
-    if o == "OCR":
-        return "OCR"
-    return "Manual"
-
-# -------- Identificação
-st.markdown("### Identificação do Paciente")
-c1, c2 = st.columns(2)
-with c1:
-    st.text_input(f"Nome do Paciente · {badgez('nome_paciente')}", key="nome_paciente", value=st.session_state.dados["nome_paciente"])
-with c2:
-    st.text_input(f"Nome da Mãe · {badgez('nome_genitora')}", key="nome_genitora", value=st.session_state.dados["nome_genitora"])
-
-c3, c4 = st.columns(2)
-with c3:
-    st.text_input(f"Cartão SUS (CNS) · {badgez('cartao_sus')}", key="cartao_sus", value=st.session_state.dados["cartao_sus"])
-with c4:
-    st.text_input(f"Data de Nascimento (DD/MM/AAAA) · {badgez('data_nascimento')}", key="data_nascimento", value=st.session_state.dados["data_nascimento"])
-
-c5, c6 = st.columns(2)
-with c5:
-    st.radio("Sexo", ["Feminino", "Masculino"], key="sexo",
-             index=0 if (st.session_state.dados.get("sexo") or "Feminino") == "Feminino" else 1)
-with c6:
-    op_raca = ["BRANCA", "PRETA", "PARDA", "AMARELA", "INDÍGENA"]
-    atual = st.session_state.dados.get("raca", "PARDA")
-    st.radio("Raça/Cor", op_raca, key="raca",
-             index=op_raca.index(atual) if atual in op_raca else 2)
-
-c7, c8 = st.columns(2)
-with c7:
-    st.text_input(f"Telefone do Paciente · {badgez('telefone_paciente')}", key="telefone_paciente", value=st.session_state.dados["telefone_paciente"])
-with c8:
-    st.text_input(f"Núm. Prontuário · {badgez('prontuario')}", key="prontuario", value=st.session_state.dados["prontuario"])
-
-# -------- Endereço
-st.markdown("### Endereço")
-c9, c10 = st.columns([3,2])
-with c9:
-    st.text_input(f"Endereço completo · {badgez('endereco_completo')}", key="endereco_completo", value=st.session_state.dados["endereco_completo"])
-with c10:
-    st.text_input(f"Município de referência · {badgez('municipio_referencia')}", key="municipio_referencia", value=st.session_state.dados["municipio_referencia"])
-
-c11, c12 = st.columns(2)
-with c11:
-    st.text_input(f"UF · {badgez('uf')}", key="uf", value=st.session_state.dados["uf"])
-with c12:
-    st.text_input(f"CEP · {badgez('cep')}", key="cep", value=st.session_state.dados["cep"])
-
-# -------- Estabelecimento
-st.markdown("### Estabelecimento")
-ops_hosp = list(HOSPITAIS.keys())
-h_idx = ops_hosp.index(st.session_state.dados["hospital"]) if st.session_state.dados["hospital"] in ops_hosp else 0
-sel_hosp = st.selectbox("Hospital / Unidade de saúde", ops_hosp, index=h_idx)
-st.session_state.dados["hospital"] = sel_hosp
-tel_padrao = HOSPITAIS.get(sel_hosp, "")
-tel_val = st.session_state.dados.get("telefone_unidade") or tel_padrao
-tel_val = st.text_input("Telefone da Unidade (padrão, pode ajustar)", value=tel_val)
-st.session_state.dados["telefone_unidade"] = tel_val
-
-# -------- Data & Hora
-st.markdown("### Data e Hora")
-c13, c14 = st.columns(2)
-with c13:
-    st.session_state.dados["data"] = st.date_input("Data", value=st.session_state.dados["data"])
-with c14:
-    st.session_state.dados["hora"] = st.time_input("Hora", value=st.session_state.dados["hora"])
-
-# -------- Clínicos
-st.markdown("### Dados clínicos")
-st.session_state.dados["diagnostico"] = st.text_input("Diagnóstico", value=st.session_state.dados["diagnostico"])
-st.session_state.dados["peso"] = st.text_input("Peso (kg)", value=st.session_state.dados["peso"])
-st.session_state.dados["antecedente_transfusional"] = st.radio("Antecedente Transfusional?", ["Não", "Sim"], index=0 if st.session_state.dados["antecedente_transfusional"]=="Não" else 1)
-st.session_state.dados["antecedentes_obstetricos"] = st.radio("Antecedentes Obstétricos?", ["Não", "Sim"], index=0 if st.session_state.dados["antecedentes_obstetricos"]=="Não" else 1)
-st.session_state.dados["modalidade_transfusao"] = st.radio("Modalidade de Transfusão", ["Rotina", "Programada", "Urgência", "Emergência"],
-                                                          index=["Rotina","Programada","Urgência","Emergência"].index(st.session_state.dados["modalidade_transfusao"]))
-
-# -------- Gerar PDF simples (exemplo)
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-
-def gerar_pdf_bytes(d):
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-    y = h - 40
-    c.setFont("Helvetica-Bold", 14); c.drawString(40, y, "Ficha HEMOBA - Resumo"); y -= 24
-    c.setFont("Helvetica", 10)
-    def line(lbl, val):
-        nonlocal y
-        c.drawString(40, y, f"{lbl}: {val}"); y -= 16
-    # principais
-    line("Paciente", d["nome_paciente"])
-    line("Mãe", d["nome_genitora"])
-    line("CNS", d["cartao_sus"])
-    line("Nascimento", d["data_nascimento"])
-    line("Sexo", d["sexo"]); line("Raça/Cor", d["raca"])
-    line("Telefone", d["telefone_paciente"]); line("Prontuário", d["prontuario"])
-    line("Endereço", d["endereco_completo"]); line("Município", d["municipio_referencia"])
-    line("UF/CEP", f'{d["uf"]} / {d["cep"]}')
-    line("Hospital", d["hospital"]); line("Telefone da Unidade", d["telefone_unidade"])
-    line("Data/Hora", f'{d["data"].strftime("%d/%m/%Y")} {d["hora"].strftime("%H:%M")}')
-    line("Diagnóstico", d["diagnostico"]); line("Peso (kg)", d["peso"])
-    line("Antecedente Transfusional", d["antecedente_transfusional"])
-    line("Antecedentes Obstétricos", d["antecedentes_obstetricos"])
-    line("Modalidade", d["modalidade_transfusao"])
-    c.showPage(); c.save()
-    buf.seek(0)
-    return buf
-
-if st.button("Gerar PDF Final"):
-    pdfbuf = gerar_pdf_bytes(st.session_state.dados)
-    st.download_button("Baixar PDF", data=pdfbuf, file_name="ficha_hemo.pdf", mime="application/pdf")
-
-# -------- Debug
-with st.expander("🐿️ Ver texto extraído e pares (debug)"):
-    st.text_area("Texto bruto", value=st.session_state.raw_text or "", height=220)
-    snap = {**st.session_state.dados}
-    st.json(snap)
+        run_streamlit_app()
