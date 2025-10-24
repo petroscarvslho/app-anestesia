@@ -1,280 +1,207 @@
-import os
-import io
+import streamlit as st
+import fitz  # PyMuPDF
 import re
 from datetime import datetime
-from flask import Flask, render_template_string, request, send_file, session, redirect, url_for, flash
+from PyPDFForm.wrapper import PdfWrapper
+import io
 
-# --- Bibliotecas para processamento de imagem e PDF ---
-import pdfplumber      # Para ler PDFs baseados em texto
-from PIL import Image  # Para manipular imagens
-import pytesseract     # O motor de OCR para ler texto de imagens
-from PyPDFForm import PdfWrapper  # Biblioteca para preencher PDFs com campos
-
-# ==============================================================================
-# CONFIGURAÇÃO INICIAL - VERIFIQUE ISTO
-# ==============================================================================
-# No ambiente do Codespaces (baseado em Linux), geralmente não precisamos configurar
-# o caminho do Tesseract. Ele já vem pré-instalado ou é fácil de instalar.
-# Deixaremos esta parte comentada por enquanto.
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-# ==============================================================================
-
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'uma_chave_secreta_muito_forte_e_dificil_de_adivinhar'
-
-# Nomes dos arquivos e pastas usados pelo app
+# --- CONFIGURAÇÃO DA PÁGINA E CONSTANTES ---
+st.set_page_config(page_title="Gerador de Ficha HEMOBA", layout="wide")
+st.title("🩸 Gerador Automático de Ficha HEMOBA")
+st.markdown("Envie a **Ficha AIH (PDF)** para pré-preencher o formulário e gerar a ficha HEMOBA final.")
 HEMOBA_TEMPLATE_PATH = 'modelo_hemo.pdf'
 
 # ==============================================================================
-# FUNÇÕES DE EXTRAÇÃO DE DADOS (O "CÉREBRO" DO APP)
+# 1. FUNÇÕES AUXILIARES DE LIMPEZA (CONSOLIDADAS)
 # ==============================================================================
 
-def extract_field(text, patterns, default=""):
-    """Função mais robusta que tenta múltiplos padrões para encontrar um campo."""
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-        if match:
-            # Pega o último grupo capturado, que geralmente é o valor
-            return match.group(match.lastindex).strip()
-    return default
+def limpar_nome(nome):
+    """Extrai apenas sequências de letras e espaços, removendo números e símbolos."""
+    if not nome: return ""
+    palavras = re.findall(r'[A-Za-zÀ-ÿ\s]+', nome)
+    return ' '.join(palavras).strip()
 
-def get_text_from_file(file_stream, filename):
-    """Extrai texto bruto de um arquivo, seja PDF ou imagem, de forma inteligente."""
-    full_text = ""
-    file_extension = os.path.splitext(filename)[1].lower()
+def limpar_numeros(texto):
+    """Extrai apenas os dígitos de uma string."""
+    if not texto: return ""
+    return re.sub(r'\D', '', texto)
 
-    if file_extension == '.pdf':
-        try:
-            # 1. Tenta ler o PDF como texto digital primeiro (mais preciso)
-            file_stream.seek(0)
-            with pdfplumber.open(file_stream) as pdf:
-                for page in pdf.pages:
-                    full_text += page.extract_text(layout=True) or ""
+# ==============================================================================
+# 2. FUNÇÕES DE EXTRAÇÃO DE DADOS (LÓGICA HÍBRIDA)
+# ==============================================================================
 
-            # 2. Se o texto for muito curto, provavelmente é um PDF de imagem. Força o OCR.
-            if len(full_text.strip()) < 200:
-                print("PDF com pouco texto, forçando OCR para mais precisão...")
-                file_stream.seek(0)
-                full_text = "" # Reseta o texto para usar apenas o do OCR
-                with pdfplumber.open(file_stream) as pdf:
-                    for page in pdf.pages:
-                        # Converte a página do PDF em uma imagem de alta qualidade
-                        image = page.to_image(resolution=300).original
-                        # Extrai texto da imagem usando o OCR
-                        full_text += pytesseract.image_to_string(image, lang='por') + '\n'
-        except Exception as e:
-            print(f"Erro ao processar PDF: {e}")
-            return ""
-
-    elif file_extension in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp']:
-        # 3. Se for imagem, usa OCR diretamente
-        try:
-            image = Image.open(file_stream)
-            full_text = pytesseract.image_to_string(image, lang='por')
-        except Exception as e:
-            print(f"Erro ao processar Imagem: {e}")
-            return ""
-    
-    # Salva o texto extraído para você poder verificar o que a IA "leu"
-    with open("extracted_text.txt", "w", encoding="utf-8") as f:
-        f.write(full_text)
-        
-    return full_text
-
-def extract_data_from_aih_text(full_text):
-    """Recebe o texto bruto e extrai os campos específicos da AIH usando padrões."""
-    
-    # Padrões de expressões regulares (regex) para encontrar os dados.
-    # Eles tentam ser flexíveis com quebras de linha e espaços.
+def extract_data_pass_A(full_text):
+    """Passagem A: Extração rápida usando Regex no texto completo."""
+    results = {}
     patterns = {
-        'nome_paciente': [r"Nome do Paciente\s*[:\-\s\n]+([A-ZÀ-ÿ\s]+)"],
-        'cartao_sus': [r"CNS\s*[:\-\s\n]+(\d{15})"],
-        'data_nascimento': [r"Data de Nasc\s*[:\-\s\n]+(\d{2}/\d{2}/\d{4})"],
-        'sexo': [r"Sexo\s*[:\-\s\n]+(Masculino|Feminino)"],
-        'nome_genitora': [r"Nome da Mãe\s*[:\-\s\n]+([A-ZÀ-ÿ\s]+)"],
-        'endereco_completo': [r"Endereço Residencial.+\s*[:\-\s\n]+(.+)"],
-        'municipio_origem': [r"Município de Referência\s*[:\-\s\n]+([A-ZÀ-ÿ\s]+)"],
-        'hospital': [r"Nome do Estabelecimento Solicitante\s*[:\-\s\n]+(.+)"],
-        'prontuario': [r"Núm\. Prontuário\s*[:\-\s\n]+(\d+)"]
+        'nome_paciente': r"Nome do Paciente\s*\n(.+)",
+        'cartao_sus': r"CNS\s*\n(\d{15})",
+        'data_nascimento': r"Data de Nasc\s*\n(\d{2}/\d{2}/\d{4})",
+        'sexo': r"Sexo\s*\n(Feminino|Masculino)",
+        'nome_genitora': r"Nome da Mãe\s*\n(.+)",
+        'endereco_residencia': r"Endereço Residencial \(Rua, Av etc\)\s*\n(.+)",
+        'municipio_origem': r"Município de Referência\s*\n([A-ZÀ-ÿ\s-]+)",
+        'prontuario': r"Núm\. Prontuário\s*\n(\d+)",
+        'hospital': r"Nome do Estabelecimento Solicitante\s*\n(.+)"
     }
-    
-    data = {}
-    for field, field_patterns in patterns.items():
-        data[field] = extract_field(full_text, field_patterns)
+    for key, pattern in patterns.items():
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            results[key] = match.group(1).strip()
+    return results
 
-    # Lógica de limpeza pós-extração
-    if data['nome_genitora'] and data['nome_paciente'] in data['nome_genitora']:
-        data['nome_genitora'] = data['nome_genitora'].replace(data['nome_paciente'], '').strip()
-
-    # Adiciona campos de data e hora atuais
-    data['data'] = datetime.now().strftime('%d/%m/%Y')
-    data['hora'] = datetime.now().strftime('%H:%M')
+def extract_data_pass_B(page):
+    """Passagem B: Extração de resgate usando coordenadas dos blocos de texto."""
+    results = {}
+    blocks = page.get_text("blocks")
+    blocks.sort(key=lambda b: (b[1], b[0]))
     
-    return data
+    coordinate_map = {
+        'nome_genitora': (510, 540),
+        'nome_paciente': (590, 620),
+        'cartao_sus': (675, 705),
+        'prontuario': (730, 760),
+    }
+    for key, (y0, y1) in coordinate_map.items():
+        for block in blocks:
+            block_y_center = (block[1] + block[3]) / 2
+            if y0 <= block_y_center <= y1:
+                text = block[4].strip()
+                if key == 'prontuario':
+                    match = re.search(r'(\d+)', text)
+                    if match: results[key] = match.group(1)
+                elif key == 'cartao_sus':
+                    results[key] = limpar_numeros(text)
+                else: # Nomes
+                    results[key] = limpar_nome(text)
+                break
+    return results
+
+def extract_data_from_aih(pdf_stream):
+    """Orquestrador: Executa a extração em múltiplas passagens."""
+    try:
+        doc = fitz.open(stream=pdf_stream.read(), filetype="pdf")
+        if not doc: return {}
+        page = doc[0]
+        full_text = page.get_text("text")
+
+        # --- PASSAGEM A ---
+        results = extract_data_pass_A(full_text)
+        
+        # --- VERIFICAÇÃO E PASSAGEM B (RESGATE) ---
+        critical_fields = ['nome_paciente', 'nome_genitora', 'cartao_sus', 'prontuario']
+        missing_fields = [field for field in critical_fields if not results.get(field)]
+
+        if missing_fields:
+            st.warning(f"Extração rápida falhou para: {', '.join(missing_fields)}. Ativando resgate por posição...")
+            rescue_results = extract_data_pass_B(page)
+            for field in missing_fields:
+                if rescue_results.get(field) and not results.get(field):
+                    results[field] = rescue_results[field]
+                    st.info(f"✔️ Campo '{field}' resgatado com sucesso!")
+
+        # --- Limpeza Final e Dados Automáticos ---
+        for key in ['nome_paciente', 'nome_genitora']:
+            if key in results:
+                results[key] = limpar_nome(results[key])
+        
+        results['data'] = datetime.now().strftime('%Y-%m-%d')
+        results['hora'] = datetime.now().strftime('%H:%M')
+
+        st.success("Extração finalizada.")
+        return results
+    except Exception as e:
+        st.error(f"Erro fatal ao processar PDF: {e}")
+        return {}
 
 # ==============================================================================
-# ROTAS DO SERVIDOR WEB (FLASK) E TEMPLATE HTML
+# 3. FUNÇÃO DE PREENCHIMENTO DE PDF
 # ==============================================================================
 
-@app.route('/')
-def index():
-    """Mostra a página inicial."""
-    session.pop('form_data', None)
-    return render_template_string(HTML_FORM_TEMPLATE, form_data={})
-
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    """Lida com o upload do arquivo (PDF ou Foto), extrai os dados e mostra o formulário."""
-    if 'file' not in request.files or request.files['file'].filename == '':
-        flash('Nenhum arquivo selecionado. Por favor, escolha um arquivo.', 'error')
-        return redirect(url_for('index'))
-    
-    file = request.files['file']
+def fill_hemoba_pdf(template_path, data):
     try:
-        file_stream = io.BytesIO(file.read())
-        raw_text = get_text_from_file(file_stream, file.filename)
-        
-        if not raw_text or not raw_text.strip():
-            flash('Não foi possível extrair texto do arquivo. Verifique se a imagem está nítida ou se o PDF não está em branco.', 'error')
-            return redirect(url_for('index'))
+        data_for_pdf = {key: str(value if value is not None else '') for key, value in data.items()}
 
-        extracted_data = extract_data_from_aih_text(raw_text)
-        session['form_data'] = extracted_data
-        flash('Dados extraídos! Por favor, revise e complete o formulário abaixo.', 'success')
-        
-        return render_template_string(HTML_FORM_TEMPLATE, form_data=extracted_data)
+        for field in ['antecedente_transfusional', 'antecedentes_obstetricos', 'reacao_transfusional']:
+            selection = data.get(field)
+            data_for_pdf[f'{field}s'] = (selection == 'Sim')
+            data_for_pdf[f'{field}n'] = (selection == 'Não')
+
+        modalidades = {"Programada": "modalidade_transfusaop", "Rotina": "modalidade_transfusaor", "Urgência": "modalidade_transfusaou", "Emergência": "modalidade_transfusaoe"}
+        selected_modalidade = data.get('modalidade_transfusao')
+        for key, pdf_field in modalidades.items():
+            data_for_pdf[pdf_field] = (key == selected_modalidade)
+
+        for product in ['hema', 'pfc', 'plaquetas_prod', 'crio']:
+             data_for_pdf[product] = (data.get(product) == True)
+
+        pdf_form = PdfWrapper(template_path)
+        pdf_form.fill(data_for_pdf, flatten=False)
+        return pdf_form.read()
     except Exception as e:
-        flash(f"Ocorreu um erro inesperado ao processar o arquivo: {e}", "error")
-        return redirect(url_for('index'))
+        st.error(f"Erro ao preencher PDF: {e}"); raise
 
-@app.route('/submit', methods=['POST'])
-def submit_form():
-    """Recebe os dados do formulário revisado e gera o PDF final."""
-    form_data = request.form.to_dict()
-    try:
-        if not os.path.exists(HEMOBA_TEMPLATE_PATH):
-            flash(f"Erro Crítico: O arquivo modelo '{HEMOBA_TEMPLATE_PATH}' não foi encontrado. Verifique se ele está na mesma pasta do `app.py`.", "error")
-            return render_template_string(HTML_FORM_TEMPLATE, form_data=form_data)
+# ==============================================================================
+# 4. INTERFACE DO APLICATIVO (STREAMLIT)
+# ==============================================================================
+
+# Inicializa o estado da sessão para guardar os dados
+if 'form_data' not in st.session_state:
+    st.session_state.form_data = {}
+
+# --- Seção de Upload ---
+with st.container(border=True):
+    st.header("1. Enviar Ficha AIH")
+    uploaded_file = st.file_uploader("Selecione o arquivo PDF da AIH", type="pdf", label_visibility="collapsed")
+    if uploaded_file is not None:
+        if st.button("Extrair Dados da AIH", type="primary"):
+            with st.spinner('Lendo AIH...'):
+                st.session_state.form_data = extract_data_from_aih(uploaded_file)
+
+# --- Seção do Formulário de Revisão ---
+if st.session_state.form_data:
+    with st.form("hemoba_form"):
+        data = st.session_state.form_data
         
-        # Usa PyPDFForm para preencher o PDF.
-        # A partir da versão 3, a classe correta é PdfWrapper. O parâmetro
-        # `flatten=True` faz o "achatamento" do PDF, tornando os campos não editáveis.
-        wrapper = PdfWrapper(HEMOBA_TEMPLATE_PATH, adobe_mode=False)
-        filled_pdf = wrapper.fill(form_data, flatten=True)
-
-        # Define o nome do arquivo de saída de forma segura
-        output_filename = f"HEMOBA_preenchido_{form_data.get('nome_paciente', 'paciente')}.pdf"
-        # Escreve o PDF preenchido em disco
-        filled_pdf.write(output_filename)
-
-        session.pop('form_data', None)
-
-        # Envia o arquivo como resposta para download
-        return send_file(
-            output_filename,
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=output_filename
-        )
-    except Exception as e:
-        flash(f"Ocorreu um erro ao gerar o PDF: {e}. Verifique se o PDF modelo tem campos de formulário corretos.", "error")
-        return render_template_string(HTML_FORM_TEMPLATE, form_data=form_data)
-
-# Template HTML com design melhorado e mais campos.
-HTML_FORM_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-    <meta charset="utf-8"/>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Preenchedor de Ficha HEMOBA</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; padding: 20px; max-width: 800px; margin: auto; background-color: #f4f7f9; }
-        .container { background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
-        h1, h2 { color: #1a237e; text-align: center; }
-        h1 { font-size: 2em; margin-bottom: 10px; }
-        h2 { font-size: 1.5em; margin-top: 40px; border-bottom: 2px solid #e0e0e0; padding-bottom: 10px; }
-        label { display: block; margin-top: 16px; margin-bottom: 6px; font-weight: 600; color: #333; }
-        input[type=text], input[type=date], input[type=time], select { width: 100%; padding: 12px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 5px; transition: border-color 0.2s; }
-        input:focus { border-color: #1a237e; outline: none; }
-        .prefilled { background-color: #e8f5e9; border-left: 4px solid #4caf50; }
-        button[type=submit] { background-color: #1a237e; color: white; padding: 14px 28px; border: none; border-radius: 5px; cursor: pointer; font-size: 1.1em; font-weight: 600; display: block; margin: 40px auto 20px auto; transition: background-color 0.2s; }
-        button[type=submit]:hover { background-color: #3f51b5; }
-        .upload-section { margin-bottom: 30px; padding: 25px; background-color: #fafafa; border: 2px dashed #ccc; border-radius: 8px; text-align: center; }
-        .flash-message { padding: 15px; margin: 20px 0; border-radius: 5px; font-size: 1.1em; text-align: center; }
-        .flash-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .flash-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
-        .field-group { margin-bottom: 10px; }
-        /* Adicionando estilos para checkboxes */
-        .checkbox-group { margin-top: 20px; }
-        .checkbox-item { display: flex; align-items: center; margin-bottom: 10px; }
-        .checkbox-item input[type="checkbox"] { margin-right: 10px; width: auto; }
-        .checkbox-item label { margin: 0; font-weight: normal; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Preenchedor Automático - HEMOBA</h1>
+        st.header("2. Revisar e Completar Formulário")
         
-        {% with messages = get_flashed_messages(with_categories=true) %}
-          {% if messages %}
-            {% for category, message in messages %}
-              <div class="flash-message flash-{{ category }}">{{ message }}</div>
-            {% endfor %}
-          {% endif %}
-        {% endwith %}
+        st.subheader("Dados Extraídos (Automático)")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.text_input("Nome do Paciente", value=data.get('nome_paciente', ''), key='nome_paciente')
+            st.text_input("Nome da Mãe", value=data.get('nome_genitora', ''), key='nome_genitora')
+        with col2:
+            st.text_input("Cartão SUS", value=data.get('cartao_sus', ''), key='cartao_sus')
+            st.text_input("Prontuário", value=data.get('prontuario', ''), key='prontuario')
 
-        <div class="upload-section">
-            <h2>1. Enviar Ficha AIH (PDF ou Foto)</h2>
-            <form action="{{ url_for('upload_file') }}" method="post" enctype="multipart/form-data">
-                <input type="file" name="file" accept=".pdf,.png,.jpg,.jpeg" required>
-                <button type="submit" style="background-color: #d32f2f; margin-top: 20px;">Extrair Dados</button>
-            </form>
-        </div>
+        st.subheader("Dados para Preenchimento (Manual)")
+        col3, col4 = st.columns(2)
+        with col3:
+            st.text_input("Diagnóstico", key='diagnostico')
+            st.selectbox("Antecedente Transfusional?", ["Não", "Sim"], key='antecedente_transfusional')
+        with col4:
+            st.text_input("Peso (kg)", key='peso')
+            st.selectbox("Antecedentes Obstétricos?", ["Não", "Sim"], key='antecedentes_obstetricos')
 
-        <form method="post" action="{{ url_for('submit_form') }}">
-            <h2>2. Revisar e Completar Dados</h2>
-            
-            <h3>Identificação</h3>
-            <div class="grid">
-                <div class="field-group"><label for="hospital">Hospital / Unidade</label><input type="text" name="hospital" class="{{ 'prefilled' if form_data.get('hospital') else '' }}" value="{{ form_data.get('hospital', '') }}"></div>
-                <div class="field-group"><label for="nome_paciente">Nome do Paciente</label><input type="text" name="nome_paciente" class="{{ 'prefilled' if form_data.get('nome_paciente') else '' }}" value="{{ form_data.get('nome_paciente', '') }}"></div>
-                <div class="field-group"><label for="nome_genitora">Nome da Mãe</label><input type="text" name="nome_genitora" class="{{ 'prefilled' if form_data.get('nome_genitora') else '' }}" value="{{ form_data.get('nome_genitora', '') }}"></div>
-                <div class="field-group"><label for="data_nascimento">Data de Nascimento (dd/mm/aaaa)</label><input type="text" name="data_nascimento" class="{{ 'prefilled' if form_data.get('data_nascimento') else '' }}" placeholder="dd/mm/aaaa" value="{{ form_data.get('data_nascimento', '') }}"></div>
-                <div class="field-group"><label for="cartao_sus">Cartão SUS (CNS)</label><input type="text" name="cartao_sus" class="{{ 'prefilled' if form_data.get('cartao_sus') else '' }}" value="{{ form_data.get('cartao_sus', '') }}"></div>
-                <div class="field-group"><label for="prontuario">Prontuário</label><input type="text" name="prontuario" class="{{ 'prefilled' if form_data.get('prontuario') else '' }}" value="{{ form_data.get('prontuario', '') }}"></div>
-                <div class="field-group"><label for="sexo">Sexo</label><input type="text" name="sexo" class="{{ 'prefilled' if form_data.get('sexo') else '' }}" value="{{ form_data.get('sexo', '') }}"></div>
-                <div class="field-group"><label for="data">Data</label><input type="text" name="data" placeholder="dd/mm/aaaa" value="{{ form_data.get('data', '') }}"></div>
-                <div class="field-group"><label for="hora">Hora</label><input type="text" name="hora" placeholder="HH:MM" value="{{ form_data.get('hora', '') }}"></div>
-            </div>
-            
-            <h3>Endereço</h3>
-            <div class="grid">
-                <div class="field-group" style="grid-column: 1 / -1;"><label for="endereco_residencia">Endereço Completo</label><input type="text" name="endereco_residencia" class="{{ 'prefilled' if form_data.get('endereco_completo') else '' }}" value="{{ form_data.get('endereco_completo', '') }}"></div>
-                <div class="field-group"><label for="municipio_origem">Município</label><input type="text" name="municipio_origem" class="{{ 'prefilled' if form_data.get('municipio_origem') else '' }}" value="{{ form_data.get('municipio_origem', '') }}"></div>
-            </div>
-
-            <h3>Dados Clínicos (Preenchimento Manual)</h3>
-            <div class="grid">
-                 <div class="field-group"><label for="diagnostico">Diagnóstico</label><input type="text" name="diagnostico" value=""></div>
-                 <div class="field-group"><label for="indicacao_transfusional">Indicação Transfusional</label><input type="text" name="indicacao_transfusional" value=""></div>
-            </div>
-
-            <h3>Hemoterapia</h3>
-            <div class="checkbox-group">
-                <div class="checkbox-item"><input type="checkbox" id="produto_hema" name="produto_hema" value="On"><label for="produto_hema">Concentrado de Hemácias</label></div>
-                <div class="checkbox-item"><input type="checkbox" id="produto_pfc" name="produto_pfc" value="On"><label for="produto_pfc">Plasma Fresco</label></div>
-                <div class="checkbox-item"><input type="checkbox" id="produto_plaquetas" name="produto_plaquetas" value="On"><label for="produto_plaquetas">Concentrado de Plaquetas</label></div>
-                <div class="checkbox-item"><input type="checkbox" id="produto_crio" name="produto_crio" value="On"><label for="produto_crio">Crioprecipitado</label></div>
-            </div>
-            
-            <button type="submit">Gerar PDF Final</button>
-        </form>
-    </div>
-</body>
-</html>
-"""
-
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5002)
+        st.subheader("Programação (Manual)")
+        st.selectbox("Modalidade de Transfusão", ["Rotina", "Programada", "Urgência", "Emergência"], key='modalidade_transfusao')
+        
+        # Botão de submissão do formulário
+        submitted = st.form_submit_button("Gerar PDF Final", type="primary")
+        if submitted:
+            with st.spinner('Gerando o PDF...'):
+                final_data = {key: value for key, value in st.session_state.items()}
+                final_data['data'] = datetime.now().strftime('%d/%m/%Y')
+                final_data['hora'] = datetime.now().strftime('%H:%M')
+                
+                try:
+                    filled_pdf_bytes = fill_hemoba_pdf(HEMOBA_TEMPLATE_PATH, final_data)
+                    st.success("PDF gerado com sucesso!")
+                    st.download_button(
+                        label="✔️ Baixar Ficha HEMOBA",
+                        data=filled_pdf_bytes,
+                        file_name=f"HEMOBA_{final_data.get('nome_paciente', 'paciente').replace(' ', '_')}.pdf",
+                        mime="application/pdf"
+                    )
+                except:
+                    pass
