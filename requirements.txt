@@ -1,4 +1,7 @@
-streamlit>=1.29,<2
-pymupdf>=1.23,<2
-pillow>=10.0
-rapidocr-onnxruntime==1.3.23  # leve; modelos ONNX já inclusos
+streamlit==1.50.0
+pymupdf==1.26.5
+reportlab==4.4.4
+# OCR opcional e leve (NÃO é obrigatório)
+rapidocr-onnxruntime==1.3.24
+Pillow==11.0.0
+numpy==2.2.6
