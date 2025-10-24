@@ -1,54 +1,50 @@
 import io
-import os
 import re
 from datetime import datetime, date, time
 
 import streamlit as st
 import fitz  # PyMuPDF
 
-# ==========================================================
-# CONFIG GERAL (mobile-first) + CSS
-# ==========================================================
+# ----------------------------------------------------------
+# CONFIG (mobile-first) + CSS
+# ----------------------------------------------------------
 st.set_page_config(page_title="Gerador de Ficha HEMOBA", layout="centered")
-
 MOBILE_CSS = """
 <style>
-.block-container {max-width: 740px !important; padding-top: 1rem;}
-h1,h2 { letter-spacing: -0.2px; }
+.block-container {max-width: 760px !important; padding-top: 1.0rem;}
+h1,h2 { letter-spacing: -0.3px; margin-bottom:.3rem; }
 h3 { margin-top: 1.0rem; }
-hr { border:none; height:1px; background:#eee; margin: 1rem 0;}
-label {font-weight:600}
-.stTextInput > div > div > input,
-.stTextArea textarea { font-size: 16px !important; } /* evita zoom em iOS */
-
-/* Badges de origem (AIH/OCR/Manual) */
-.badge {display:inline-flex; align-items:center; gap:.4rem; font-size:.8rem; padding:.15rem .5rem; border-radius:999px; background:#eef2ff; color:#1f2937; border:1px solid #dbeafe;}
+.badge {display:inline-flex; align-items:center; gap:.35rem; font-size:.78rem; padding:.12rem .48rem; border-radius:999px; background:#eef2ff; color:#1e293b; border:1px solid #dbeafe;}
 .badge .dot {width:.55rem;height:.55rem;border-radius:50%;}
 .dot-aih {background:#3b82f6;}   /* azul */
 .dot-ocr {background:#22c55e;}   /* verde */
-.dot-man {background:#9ca3af;}   /* cinza */
-
-/* cor no label quando preenchido por extração */
-.field-aih label:before { content:""; display:inline-block; width:.6rem; height:.6rem; border-radius:50%; background:#3b82f6; margin-right:.5rem; vertical-align:middle; }
-.field-ocr label:before { content:""; display:inline-block; width:.6rem; height:.6rem; border-radius:50%; background:#22c55e; margin-right:.5rem; vertical-align:middle; }
-.section-card { border:1px solid #eee; border-radius:12px; padding:1rem; background:#fff; }
+.dot-man {background:#cbd5e1;}   /* cinza */
+.stTextInput > div > div > input,
+.stTextArea textarea { font-size: 16px !important; } /* evita zoom no iOS */
+label {font-weight:600}
+hr { border:none; height:1px; background:#eee; margin: 1rem 0;}
+.field-aih label:before, .field-ocr label:before, .field-man label:before {
+  content:""; display:inline-block; width:.6rem; height:.6rem; border-radius:50%;
+  margin-right:.5rem; vertical-align:middle;
+}
+.field-aih label:before { background:#3b82f6;}
+.field-ocr label:before { background:#22c55e;}
+.field-man label:before { background:#94a3b8;}
 </style>
 """
 st.markdown(MOBILE_CSS, unsafe_allow_html=True)
 
-# ==========================================================
+# ----------------------------------------------------------
 # CONSTANTES / MAPAS
-# ==========================================================
-HEMOBA_TEMPLATE_PATH = "modelo_hemo.pdf"  # se não existir, gera PDF simples (fallback)
-
+# ----------------------------------------------------------
 HOSPITAIS = {
     "Maternidade Frei Justo Venture": "(75) 3331-9400",
     "Hospital Regional da Chapada Diamantina": "(75) 3331-9900",
 }
 
-# ==========================================================
-# HELPERS DE LIMPEZA
-# ==========================================================
+# ----------------------------------------------------------
+# HELPERs
+# ----------------------------------------------------------
 def limpar_nome(txt: str) -> str:
     if not txt:
         return ""
@@ -83,18 +79,19 @@ def parece_rotulo(linha: str) -> bool:
     ]
     return any(k in chk for k in chaves)
 
-# ==========================================================
-# PDF → TEXTO (PyMuPDF) + PARSER ROBUSTO
-# ==========================================================
+# ----------------------------------------------------------
+# PDF → TEXTO → CAMPOS
+# ----------------------------------------------------------
 def get_page_lines(pdf_bytes: bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
-    raw = page.get_text("text")
+    raw = page.get_text("text")  # melhor preserva linhas para esse layout
     lines = [re.sub(r"\s+", " ", ln.strip()) for ln in raw.splitlines()]
     lines = [ln for ln in lines if ln]
     return lines, raw
 
 def pick_after(lines, label, max_ahead=3, prefer_digits=False, prefer_date=False):
+    """Procura um rótulo (label) e retorna a melhor linha seguinte (até max_ahead)."""
     label_norm = label.lower()
     for i, ln in enumerate(lines):
         if label_norm in ln.lower():
@@ -112,7 +109,7 @@ def pick_after(lines, label, max_ahead=3, prefer_digits=False, prefer_date=False
                         if dd:
                             return dd
                     return cand
-            # senão, pega próximas linhas
+            # senão, olha próximas linhas
             for j in range(1, max_ahead + 1):
                 if i + j >= len(lines):
                     break
@@ -130,31 +127,8 @@ def pick_after(lines, label, max_ahead=3, prefer_digits=False, prefer_date=False
                 return cand
     return ""
 
-def parse_aih_from_text(lines):
-    data = {
-        "nome_paciente": "",
-        "nome_genitora": "",
-        "cartao_sus": "",
-        "data_nascimento": "",
-        "sexo": "",
-        "raca": "",
-        "telefone_paciente": "",
-        "prontuario": "",
-        "endereco_completo": "",
-        "municipio_referencia": "",
-        "uf": "",
-        "cep": "",
-        # manuais/padrões
-        "hospital": "Maternidade Frei Justo Venture",
-        "telefone_unidade": HOSPITAIS["Maternidade Frei Justo Venture"],
-        "data": date.today(),
-        "hora": datetime.now().time().replace(microsecond=0),
-        "diagnostico": "",
-        "peso": "",
-        "antecedente_transfusional": "Não",
-        "antecedentes_obstetricos": "Não",
-        "modalidade_transfusao": "Rotina",
-    }
+def parse_aih_from_lines(lines):
+    data = default_dados()
 
     data["nome_paciente"]        = limpar_nome(pick_after(lines, "Nome do Paciente"))
     data["nome_genitora"]        = limpar_nome(pick_after(lines, "Nome da Mãe"))
@@ -162,15 +136,18 @@ def parse_aih_from_text(lines):
     data["data_nascimento"]      = normaliza_data(pick_after(lines, "Data de Nasc", prefer_date=True))
 
     sx = pick_after(lines, "Sexo")
-    if "fem" in sx.lower(): data["sexo"] = "Feminino"
-    elif "mas" in sx.lower(): data["sexo"] = "Masculino"
+    if "fem" in sx.lower():
+        data["sexo"] = "Feminino"
+    elif "mas" in sx.lower():
+        data["sexo"] = "Masculino"
 
     rc = pick_after(lines, "Raça") or pick_after(lines, "Raça/Cor")
     data["raca"] = limpar_nome(rc).upper() if rc else ""
 
     tel = pick_after(lines, "Telefone", prefer_digits=True) or pick_after(lines, "Telefone de Contato", prefer_digits=True)
-    tel_fmt = re.sub(r"(\d{2})(\d{4,5})(\d{4})", r"(\1) \2-\3", so_digitos(tel)) if tel else ""
-    data["telefone_paciente"] = tel_fmt
+    if tel:
+        tel_d = so_digitos(tel)
+        data["telefone_paciente"] = re.sub(r"(\d{2})(\d{4,5})(\d{4})", r"(\1) \2-\3", tel_d) if len(tel_d) >= 10 else tel
 
     data["prontuario"]           = so_digitos(pick_after(lines, "Prontuário", prefer_digits=True))
     data["municipio_referencia"] = limpar_nome(pick_after(lines, "Município de Referência") or pick_after(lines, "Município de Referencia"))
@@ -184,19 +161,15 @@ def parse_aih_from_text(lines):
 
     return data
 
-def extract_from_pdf(file):
-    try:
-        pdf_bytes = file.read()
-        lines, raw = get_page_lines(pdf_bytes)
-        parsed = parse_aih_from_text(lines)
-        return parsed, raw
-    except Exception as e:
-        st.error(f"Falha ao ler PDF: {e}")
-        return {}, ""
+def extract_from_pdf(uploaded_file):
+    pdf_bytes = uploaded_file.read()
+    lines, raw = get_page_lines(pdf_bytes)
+    parsed = parse_aih_from_lines(lines)
+    return parsed, raw
 
-# ==========================================================
-# OCR (opcional e leve): usa RapidOCR se instalado; senão ignora
-# ==========================================================
+# ----------------------------------------------------------
+# OCR (opcional): RapidOCR. Se não estiver instalado, ignora.
+# ----------------------------------------------------------
 def try_rapid_ocr(image_bytes: bytes):
     try:
         from rapidocr_onnxruntime import RapidOCR
@@ -205,54 +178,29 @@ def try_rapid_ocr(image_bytes: bytes):
 
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         arr = np.array(img)
-        ocr = RapidOCR()
+        ocr = RapidOCR()  # modelos embarcados (sem baixar na nuvem)
         result, _ = ocr(arr)
         txt = "\n".join([r[1] for r in result]) if result else ""
         lines = [re.sub(r"\s+", " ", ln.strip()) for ln in txt.splitlines()]
         lines = [ln for ln in lines if ln]
-        parsed = parse_aih_from_text(lines)
+        parsed = parse_aih_from_lines(lines)
         return parsed, txt
     except Exception as e:
-        # só informa; não quebra
-        st.info(f"OCR opcional indisponível: {e}")
-        return {}, ""
+        # não quebra o app
+        return {}, f"OCR não disponível: {e}"
 
-def extract_from_image(file):
-    return try_rapid_ocr(file.read())
+def extract_from_image(uploaded_file):
+    bytes_ = uploaded_file.read()
+    parsed, text = try_rapid_ocr(bytes_)
+    return parsed, text
 
-# ==========================================================
-# FORM / UI HELPERS
-# ==========================================================
-def field_container_class(key: str) -> str:
-    origin = st.session_state.origem.get(key, "MAN")
-    if origin == "AIH":
-        return "field-aih"
-    if origin == "OCR":
-        return "field-ocr"
-    return ""
-
-def label_with_origin(lbl: str, key: str, input_kind="text", **kwargs):
-    cls = field_container_class(key)
-    st.markdown(f'<div class="{cls}">', unsafe_allow_html=True)
-    if input_kind == "text":
-        st.text_input(lbl, key=key, value=st.session_state.dados.get(key, ""), **kwargs)
-    elif input_kind == "radio":
-        # kwargs deve conter 'options' e opcionalmente 'index'
-        st.radio(lbl, key=key, **kwargs)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-def update_phone_when_hospital_changes():
-    hosp = st.session_state.get("hospital", "")
-    if hosp in HOSPITAIS:
-        st.session_state["telefone_unidade"] = HOSPITAIS[hosp]
-
-# ==========================================================
-# ESTADO INICIAL
-# ==========================================================
-if "dados" not in st.session_state:
-    st.session_state.dados = {
+# ----------------------------------------------------------
+# ESTADO INICIAL (evita KeyError)
+# ----------------------------------------------------------
+def default_dados():
+    return {
         "nome_paciente": "", "nome_genitora": "", "cartao_sus": "", "data_nascimento": "",
-        "sexo": "", "raca": "", "telefone_paciente": "", "prontuario": "",
+        "sexo": "Feminino", "raca": "PARDA", "telefone_paciente": "", "prontuario": "",
         "endereco_completo": "", "municipio_referencia": "", "uf": "", "cep": "",
         "hospital": "Maternidade Frei Justo Venture",
         "telefone_unidade": HOSPITAIS["Maternidade Frei Justo Venture"],
@@ -262,258 +210,152 @@ if "dados" not in st.session_state:
         "modalidade_transfusao": "Rotina",
     }
 
+if "dados" not in st.session_state:
+    st.session_state.dados = default_dados()
+
 if "origem" not in st.session_state:
     st.session_state.origem = {k: "MAN" for k in st.session_state.dados.keys()}
 
-st.session_state.setdefault("raw_txt", "")
+if "raw_text" not in st.session_state:
+    st.session_state.raw_text = ""
 
-# ==========================================================
-# UI — SEMPRE MOSTRA FORMULÁRIO. Upload apenas PREENCHE.
-# ==========================================================
+# ----------------------------------------------------------
+# UI
+# ----------------------------------------------------------
 st.title("🩸 Gerador Automático de Ficha HEMOBA")
 st.caption(
-    'Envie **PDF da AIH** (preferencial) **ou foto** (JPG/PNG). '
-    'A cor do marcador no rótulo indica a origem do valor: '
+    'Envie **PDF da AIH** (preferencial) **ou foto** (JPG/PNG). A cor do marcador no rótulo indica a origem do valor: '
     '<span class="badge"><span class="dot dot-aih"></span>AIH</span> '
     '<span class="badge"><span class="dot dot-ocr"></span>OCR</span> '
     '<span class="badge"><span class="dot dot-man"></span>Manual</span>.',
     unsafe_allow_html=True
 )
 
-# UPLOAD (preenche depois — o formulário fica sempre visível)
-with st.container():
-    st.subheader("1) Enviar Ficha AIH (PDF) ou Foto (opcional)")
-    up = st.file_uploader("Arraste o PDF ou a foto (JPG/PNG)",
-                          type=["pdf", "jpg", "jpeg", "png"], label_visibility="collapsed")
+# 1) Upload
+st.subheader("1) Enviar Ficha AIH (PDF) ou Foto (opcional) ↩︎")
+up = st.file_uploader("Arraste o PDF ou a foto (JPG/PNG)", type=["pdf", "jpg", "jpeg", "png"], label_visibility="collapsed")
 
-    if up is not None:
-        is_pdf = up.name.lower().endswith(".pdf")
-        if is_pdf:
+if up is not None:
+    is_pdf = up.name.lower().endswith(".pdf")
+    if is_pdf:
+        try:
             dados, raw_txt = extract_from_pdf(up)
             origem = "AIH"
-        else:
-            dados, raw_txt = extract_from_image(up)
-            origem = "OCR"
+        except Exception as e:
+            dados, raw_txt, origem = {}, f"Falha ao ler PDF: {e}", "MAN"
+    else:
+        dados, raw_txt = extract_from_image(up)
+        origem = "OCR" if dados else "MAN"
 
-        if dados:
-            for k, v in dados.items():
-                if v not in (None, ""):
-                    st.session_state.dados[k] = v
-                    st.session_state.origem[k] = origem
-            st.session_state.raw_txt = raw_txt or st.session_state.raw_txt
-            st.success("Dados extraídos e aplicados ao formulário.")
-        else:
-            st.warning("Não foi possível extrair automaticamente. Preencha manualmente.")
+    # aplica no estado
+    if dados:
+        for k, v in dados.items():
+            if v not in (None, ""):
+                st.session_state.dados[k] = v
+                st.session_state.origem[k] = origem
+        st.success("Dados extraídos e aplicados ao formulário.")
+    else:
+        st.warning("Não foi possível extrair automaticamente. Preencha manualmente abaixo.")
 
+    st.session_state.raw_text = raw_txt or ""
+
+# 2) Formulário
 st.subheader("2) Revisar e completar formulário")
 
-# --------- IDENTIFICAÇÃO ----------
-with st.container():
-    st.markdown("### Identificação do Paciente")
-    label_with_origin("Nome do Paciente", "nome_paciente")
-    label_with_origin("Nome da Mãe", "nome_genitora")
-    label_with_origin("Cartão SUS (CNS)", "cartao_sus")
-    label_with_origin("Data de Nascimento (DD/MM/AAAA)", "data_nascimento")
+def field_class(key):
+    o = st.session_state.origem.get(key, "MAN")
+    return "field-aih" if o == "AIH" else ("field-ocr" if o == "OCR" else "field-man")
 
-    # Sexo
-    sexo_atual = st.session_state.dados.get("sexo") or "Feminino"
-    label_with_origin(
-        "Sexo",
-        "sexo",
-        input_kind="radio",
-        options=["Feminino", "Masculino"],
-        index=0 if sexo_atual == "Feminino" else 1
-    )
-    # Raça/Cor
-    r_opts = ["BRANCA", "PRETA", "PARDA", "AMARELA", "INDÍGENA"]
-    r_atual = st.session_state.dados.get("raca") or "PARDA"
-    label_with_origin(
-        "Raça/Cor",
-        "raca",
-        input_kind="radio",
-        options=r_opts,
-        index=r_opts.index(r_atual) if r_atual in r_opts else 2
-    )
+def input_text(label, key):
+    st.markdown(f'<div class="{field_class(key)}">', unsafe_allow_html=True)
+    st.text_input(label, key=key, value=st.session_state.dados.get(key, ""))
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    label_with_origin("Telefone do Paciente", "telefone_paciente")
-    label_with_origin("Núm. Prontuário", "prontuario")
+# Identificação
+st.markdown("### Identificação do Paciente")
+input_text("Nome do Paciente", "nome_paciente")
+input_text("Nome da Mãe", "nome_genitora")
+input_text("Cartão SUS (CNS)", "cartao_sus")
+input_text("Data de Nascimento (DD/MM/AAAA)", "data_nascimento")
 
-# --------- ENDEREÇO ----------
-with st.container():
-    st.markdown("### Endereço")
-    label_with_origin("Endereço completo", "endereco_completo")
-    label_with_origin("Município de referência", "municipio_referencia")
-    label_with_origin("UF", "uf")
-    label_with_origin("CEP", "cep")
+st.markdown(f'<div class="{field_class("sexo")}">', unsafe_allow_html=True)
+st.radio("Sexo", ["Feminino", "Masculino"], key="sexo",
+         index=0 if st.session_state.dados.get("sexo","Feminino")=="Feminino" else 1)
+st.markdown('</div>', unsafe_allow_html=True)
 
-# --------- ESTABELECIMENTO ----------
-with st.container():
-    st.markdown("### Estabelecimento (selecione)")
-    hosp_default = st.session_state.dados.get("hospital", "Maternidade Frei Justo Venture")
-    st.radio("🏥 Hospital / Unidade de saúde", list(HOSPITAIS.keys()), key="hospital",
-             index=list(HOSPITAIS.keys()).index(hosp_default) if hosp_default in HOSPITAIS else 0,
-             on_change=update_phone_when_hospital_changes)
-    label_with_origin("☎️ Telefone da Unidade", "telefone_unidade")
+st.markdown(f'<div class="{field_class("raca")}">', unsafe_allow_html=True)
+op_raca = ["BRANCA", "PRETA", "PARDA", "AMARELA", "INDÍGENA"]
+r_default = st.session_state.dados.get("raca","PARDA")
+st.radio("Raça/Cor", op_raca,
+         key="raca",
+         index=op_raca.index(r_default) if r_default in op_raca else 2)
+st.markdown('</div>', unsafe_allow_html=True)
 
-# --------- DATA & HORA ----------
-with st.container():
-    st.markdown("### Data e Hora")
-    st.date_input("📅 Data", key="data", value=st.session_state.dados.get("data", date.today()))
-    st.time_input("⏰ Hora", key="hora", value=st.session_state.dados.get("hora", datetime.now().time().replace(microsecond=0)))
+input_text("Telefone do Paciente", "telefone_paciente")
+input_text("Núm. Prontuário", "prontuario")
 
-# --------- DADOS CLÍNICOS ----------
-with st.container():
-    st.markdown("### Dados clínicos (manuais)")
-    label_with_origin("🩺 Diagnóstico", "diagnostico")
-    label_with_origin("⚖️ Peso (kg)", "peso")
-    st.radio("🩸 Antecedente Transfusional?", ["Não", "Sim"], key="antecedente_transfusional",
-             index=0 if st.session_state.dados.get("antecedente_transfusional", "Não") == "Não" else 1)
-    st.radio("🤰 Antecedentes Obstétricos?", ["Não", "Sim"], key="antecedentes_obstetricos",
-             index=0 if st.session_state.dados.get("antecedentes_obstetricos", "Não") == "Não" else 1)
-    st.radio("✍️ Modalidade de Transfusão", ["Rotina", "Programada", "Urgência", "Emergência"], key="modalidade_transfusao",
-             index=["Rotina", "Programada", "Urgência", "Emergência"].index(st.session_state.dados.get("modalidade_transfusao", "Rotina")))
+# Endereço
+st.markdown("### Endereço")
+input_text("Endereço completo", "endereco_completo")
+input_text("Município de referência", "municipio_referencia")
+input_text("UF", "uf")
+input_text("CEP", "cep")
 
-# ==========================================================
-# GERAÇÃO DE PDF (template se houver, senão fallback simples)
-# ==========================================================
-def generate_pdf_bytes(data_dict: dict) -> bytes:
-    """
-    1) Se existir um formulário 'modelo_hemo.pdf', tenta preencher com PyPDFForm.
-    2) Se não existir (ou der erro), gera um PDF simples com ReportLab contendo os campos.
-    Nunca levanta exceção para não derrubar o app.
-    """
-    # 1) Tentar com template
-    try:
-        if os.path.exists(HEMOBA_TEMPLATE_PATH):
-            from PyPDFForm.wrapper import PdfWrapper
-            # Mapeie aqui os nomes dos campos do seu PDF. Campos desconhecidos são ignorados pelo PyPDFForm.
-            mapping = {
-                "nome_paciente": data_dict.get("nome_paciente", ""),
-                "nome_mae": data_dict.get("nome_genitora", ""),
-                "cns": data_dict.get("cartao_sus", ""),
-                "data_nasc": data_dict.get("data_nascimento", ""),
-                "sexo": data_dict.get("sexo", ""),
-                "raca": data_dict.get("raca", ""),
-                "telefone_paciente": data_dict.get("telefone_paciente", ""),
-                "prontuario": data_dict.get("prontuario", ""),
-                "endereco": data_dict.get("endereco_completo", ""),
-                "municipio": data_dict.get("municipio_referencia", ""),
-                "uf": data_dict.get("uf", ""),
-                "cep": data_dict.get("cep", ""),
-                "hospital": data_dict.get("hospital", ""),
-                "telefone_unidade": data_dict.get("telefone_unidade", ""),
-                "data": str(data_dict.get("data", "")),
-                "hora": str(data_dict.get("hora", "")),
-                "diagnostico": data_dict.get("diagnostico", ""),
-                "peso": data_dict.get("peso", ""),
-                "antecedente_transfusional": data_dict.get("antecedente_transfusional", ""),
-                "antecedentes_obstetricos": data_dict.get("antecedentes_obstetricos", ""),
-                "modalidade_transfusao": data_dict.get("modalidade_transfusao", ""),
-            }
-            pdf = PdfWrapper(HEMOBA_TEMPLATE_PATH)
-            pdf.fill(mapping, flatten=False)
-            return pdf.read()
-    except Exception as e:
-        st.info(f"Não foi possível preencher o template: {e}. Gerando PDF simples...")
+# Estabelecimento
+def update_phone_when_hospital_changes():
+    hosp = st.session_state.get("hospital", "")
+    if hosp in HOSPITAIS:
+        st.session_state["telefone_unidade"] = HOSPITAIS[hosp]
 
-    # 2) Fallback: PDF simples com ReportLab
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.units import cm
+st.markdown("### Estabelecimento (selecione)")
+st.radio("🏥 Hospital / Unidade de saúde", list(HOSPITAIS.keys()), key="hospital",
+         index=list(HOSPITAIS.keys()).index(st.session_state.dados.get("hospital","Maternidade Frei Justo Venture")),
+         on_change=update_phone_when_hospital_changes)
+st.text_input("☎️ Telefone da Unidade (padrão, pode ajustar)", key="telefone_unidade",
+              value=st.session_state.dados.get("telefone_unidade", HOSPITAIS["Maternidade Frei Justo Venture"]))
 
-        buf = io.BytesIO()
-        cnv = canvas.Canvas(buf, pagesize=A4)
-        w, h = A4
-        x, y = 2*cm, h - 2.5*cm
+# Data & Hora
+st.markdown("### Data e Hora")
+st.date_input("📅 Data", key="data", value=st.session_state.dados.get("data", date.today()))
+st.time_input("⏰ Hora", key="hora", value=st.session_state.dados.get("hora", datetime.now().time().replace(microsecond=0)))
 
-        def draw_line(label, value):
-            nonlocal y
-            cnv.setFont("Helvetica-Bold", 10)
-            cnv.drawString(x, y, f"{label}:")
-            cnv.setFont("Helvetica", 10)
-            cnv.drawString(x + 5.5*cm, y, str(value or ""))
-            y -= 0.6*cm
+# Dados clínicos
+st.markdown("### Dados clínicos (manuais)")
+st.text_input("🩺 Diagnóstico", key="diagnostico", value=st.session_state.dados.get("diagnostico",""))
+st.text_input("⚖️ Peso (kg)", key="peso", value=st.session_state.dados.get("peso",""))
+st.radio("🩸 Antecedente Transfusional?", ["Não", "Sim"], key="antecedente_transfusional",
+         index=0 if st.session_state.dados.get("antecedente_transfusional","Não")=="Não" else 1)
+st.radio("🤰 Antecedentes Obstétricos?", ["Não", "Sim"], key="antecedentes_obstetricos",
+         index=0 if st.session_state.dados.get("antecedentes_obstetricos","Não")=="Não" else 1)
+st.radio("✍️ Modalidade de Transfusão", ["Rotina", "Programada", "Urgência", "Emergência"], key="modalidade_transfusao",
+         index=["Rotina", "Programada", "Urgência", "Emergência"].index(st.session_state.dados.get("modalidade_transfusao","Rotina")))
 
-        cnv.setFont("Helvetica-Bold", 14)
-        cnv.drawString(x, y, "Ficha HEMOBA (Gerada)")
-        y -= 1.0*cm
+# Sincroniza edits dos widgets -> st.session_state.dados
+for k in list(st.session_state.dados.keys()):
+    if k in st.session_state:
+        st.session_state.dados[k] = st.session_state[k]
 
-        fields = [
-            ("Nome do Paciente", data_dict.get("nome_paciente")),
-            ("Nome da Mãe", data_dict.get("nome_genitora")),
-            ("CNS", data_dict.get("cartao_sus")),
-            ("Data de Nascimento", data_dict.get("data_nascimento")),
-            ("Sexo", data_dict.get("sexo")),
-            ("Raça/Cor", data_dict.get("raca")),
-            ("Telefone do Paciente", data_dict.get("telefone_paciente")),
-            ("Prontuário", data_dict.get("prontuario")),
-            ("Endereço", data_dict.get("endereco_completo")),
-            ("Município", data_dict.get("municipio_referencia")),
-            ("UF", data_dict.get("uf")),
-            ("CEP", data_dict.get("cep")),
-            ("Hospital/Unidade", data_dict.get("hospital")),
-            ("Tel. Unidade", data_dict.get("telefone_unidade")),
-            ("Data", data_dict.get("data")),
-            ("Hora", data_dict.get("hora")),
-            ("Diagnóstico", data_dict.get("diagnostico")),
-            ("Peso", data_dict.get("peso")),
-            ("Antecedente Transfusional?", data_dict.get("antecedente_transfusional")),
-            ("Antecedentes Obstétricos?", data_dict.get("antecedentes_obstetricos")),
-            ("Modalidade de Transfusão", data_dict.get("modalidade_transfusao")),
-        ]
+# BOTÃO PDF (placeholder: aqui você chama o gerador baseado no template)
+st.button("Gerar PDF Final", type="primary")
 
-        for lbl, val in fields:
-            if y < 2*cm:
-                cnv.showPage()
-                y = h - 2.5*cm
-            draw_line(lbl, val)
-
-        cnv.showPage()
-        cnv.save()
-        buf.seek(0)
-        return buf.getvalue()
-    except Exception as e:
-        st.error(f"Falha ao gerar PDF: {e}")
-        return b""
-
-if st.button("Gerar PDF Final", type="primary"):
-    # snapshot limpo para PDF
-    snap = dict(st.session_state.dados)
-    # garantir strings em data/hora
-    if isinstance(snap.get("data"), date):
-        snap["data"] = snap["data"].strftime("%d/%m/%Y")
-    if isinstance(snap.get("hora"), time):
-        snap["hora"] = snap["hora"].strftime("%H:%M")
-
-    pdf_bytes = generate_pdf_bytes(snap)
-    if pdf_bytes:
-        nome = st.session_state.dados.get("nome_paciente", "paciente").strip().replace(" ", "_") or "paciente"
-        st.download_button(
-            "⬇️ Baixar Ficha HEMOBA",
-            data=pdf_bytes,
-            file_name=f"HEMOBA_{nome}.pdf",
-            mime="application/pdf",
-        )
-    else:
-        st.warning("Não foi possível gerar o PDF neste momento.")
-
-# ==========================================================
-# DEBUG / LOGS
-# ==========================================================
-with st.expander("🐿️ Debug: ver texto extraído e snapshot dos dados"):
-    st.text_area("Texto bruto (última extração)", value=st.session_state.get("raw_txt", ""), height=220)
-    # snapshot dos dados (serializável)
-    snap = dict(st.session_state.dados)
-    dd = snap.get("data")
-    hh = snap.get("hora")
-    if isinstance(dd, date):
-        snap["data"] = dd.strftime("%d/%m/%Y")
-    if isinstance(hh, time):
-        snap["hora"] = hh.strftime("%H:%M")
-
+# ----------------------------------------------------------
+# DEBUG / LOGs
+# ----------------------------------------------------------
+with st.expander("🐿️ Ver texto extraído e pares (debug)"):
+    st.text_area("Texto bruto", value=st.session_state.raw_text or "", height=220)
+    # Snapshot JSON-friendly
+    snap = {}
+    for k, v in st.session_state.dados.items():
+        if isinstance(v, (date, datetime, time)):
+            try:
+                snap[k] = v.isoformat()
+            except Exception:
+                snap[k] = str(v)
+        else:
+            snap[k] = v
     st.json(snap)
 
+    # Downloads
     import json, csv
     buf_json = io.BytesIO(json.dumps(snap, ensure_ascii=False, indent=2).encode("utf-8"))
     st.download_button("Baixar .json", data=buf_json, file_name="extracao.json", mime="application/json")
@@ -522,4 +364,5 @@ with st.expander("🐿️ Debug: ver texto extraído e snapshot dos dados"):
     writer = csv.DictWriter(buf_csv, fieldnames=list(snap.keys()))
     writer.writeheader()
     writer.writerow(snap)
-    st.download_button("Baixar .csv", data=buf_csv.getvalue().encode("utf-8"), file_name="extracao.csv", mime="text/csv")
+    st.download_button("Baixar .csv", data=buf_csv.getvalue().encode("utf-8"),
+                       file_name="extracao.csv", mime="text/csv")
