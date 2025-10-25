@@ -1,5 +1,6 @@
 streamlit
 pymupdf
-rapidocr-onnxruntime # opcional; pode tirar se não quiser OCR de foto
+rapidocr-onnxruntime
 Pillow
 numpy
+reportlab
