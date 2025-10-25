@@ -121,19 +121,17 @@ def get_value(field, default=""):
 
 st.markdown("---")
 st.markdown("### 👤 Dados do Paciente")
-
+# ... (o resto do formulário continua idêntico)
 col1, col2 = st.columns(2)
 with col1:
     st.text_input("Nome do Paciente", get_value("nome_paciente"), key="nome_paciente")
 with col2:
     st.text_input("Nome da Mãe", get_value("nome_genitora"), key="nome_genitora")
-
 col3, col4 = st.columns(2)
 with col3:
     st.text_input("CNS (Cartão SUS)", get_value("cartao_sus"), key="cartao_sus")
 with col4:
     st.text_input("Data de Nascimento", get_value("data_nascimento"), key="data_nascimento")
-
 col5, col6 = st.columns(2)
 with col5:
     sexo_options = ["", "Feminino", "Masculino"]
@@ -142,17 +140,14 @@ with col5:
     st.selectbox("Sexo", sexo_options, index=sexo_idx, key="sexo")
 with col6:
     st.text_input("Raça/Cor", get_value("raca"), key="raca")
-
 col7, col8 = st.columns(2)
 with col7:
     st.text_input("Telefone de Contato", get_value("telefone_paciente"), key="telefone_paciente")
 with col8:
     st.text_input("Nº Prontuário", get_value("prontuario"), key="prontuario")
-
 st.markdown("---")
 st.markdown("### 📍 Endereço")
 st.text_area("Endereço Completo", get_value("endereco_completo"), key="endereco_completo", height=80)
-
 col9, col10, col11 = st.columns([2, 1, 1])
 with col9:
     st.text_input("Município", get_value("municipio_referencia"), key="municipio_referencia")
@@ -160,10 +155,8 @@ with col10:
     st.text_input("UF", get_value("uf"), key="uf", max_chars=2)
 with col11:
     st.text_input("CEP", get_value("cep"), key="cep")
-
 st.markdown("---")
 st.markdown("### 🩺 Dados Clínicos")
 st.text_area("Diagnóstico Inicial", get_value("diagnostico"), key="diagnostico", height=100)
-
 with st.expander("🔍 Ver texto completo extraído (debug)"):
     st.code(st.session_state.full_text_debug, language="text")
