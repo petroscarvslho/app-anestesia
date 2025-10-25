@@ -290,104 +290,73 @@ def parse_aih_tabular(pdf_bytes: bytes):
                     data["data_nascimento"] = normaliza_data(value)
                 
                 elif field == "sexo":
-                    sexo_value = value.strip().upper()
-                    if "FEMININO" in sexo_value or "F" == sexo_value:
+                    if re.search(r"fem", value, re.IGNORECASE):
                         data["sexo"] = "Feminino"
-                    elif "MASCULINO" in sexo_value or "M" == sexo_value:
+                    elif re.search(r"masc", value, re.IGNORECASE):
                         data["sexo"] = "Masculino"
                 
                 elif field == "raca":
-                    # Raça pode vir com outras informações, pegar só a primeira palavra
-                    raca_value = value.strip().split()[0] if value.strip() else ""
-                    data["raca"] = raca_value.upper()
-                
-                elif field in ["telefone_contato", "telefone_celular"]:
-                    data["telefone_paciente"] = normaliza_telefone(value)
+                    data["raca"] = limpar_nome(value)
                 
                 elif field == "prontuario":
                     data["prontuario"] = so_digitos(value)
                 
-                elif field == "atendimento":
-                    # Atendimento geralmente é um número, pode ser útil mas não é crítico
-                    pass
+                elif field in ["telefone_contato", "telefone_celular"]:
+                    if not data["telefone_paciente"]:
+                        data["telefone_paciente"] = normaliza_telefone(value)
                 
                 elif field == "endereco":
-                    data["endereco_completo"] = value.strip()
+                    # Endereço é um campo longo, pegar a linha inteira
+                    data["endereco_completo"] = line_text.replace(match_info["label"], "").strip()
+                    # Se a linha de valor for mais completa, usar ela
+                    if value_line["text"]:
+                        data["endereco_completo"] = value_line["text"]
                 
                 elif field == "municipio":
                     data["municipio_referencia"] = limpar_nome(value)
                 
                 elif field == "uf":
-                    uf_match = re.search(r"\b([A-Z]{2})\b", value.upper())
-                    if uf_match:
-                        data["uf"] = uf_match.group(1)
+                    data["uf"] = limpar_nome(value)[:2].upper()
                 
                 elif field == "cep":
-                    digits = so_digitos(value)
-                    if len(digits) >= 8:
-                        data["cep"] = f"{digits[:5]}-{digits[5:8]}"
-                    else:
-                        data["cep"] = digits
+                    data["cep"] = so_digitos(value)[:8]
+                
     
+    # Tentativa de extrair diagnóstico (se houver)
+    for line in lines:
+        if re.search(r"diagnóstico", line["text"], re.IGNORECASE):
+            # Tenta pegar a linha seguinte como diagnóstico
+            try:
+                diag_line = lines[lines.index(line) + 1]
+                data["diagnostico"] = diag_line["text"]
+            except IndexError:
+                pass
+
     return data
 
-def try_rapid_ocr(image_bytes: bytes):
-    """OCR com RapidOCR"""
+# ----------------------------------------------------------
+# EXTRAÇÃO COM OCR
+# ----------------------------------------------------------
+def try_rapid_ocr(img_bytes: bytes):
+    """Tenta extrair dados usando OCR"""
     try:
         from rapidocr_onnxruntime import RapidOCR
-        import numpy as np
-        from PIL import Image
-
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        arr = np.array(img)
+        
         ocr = RapidOCR()
-        result, _ = ocr(arr)
+        
+        # O RapidOCR espera um caminho de arquivo ou bytes
+        # Criar um buffer para a imagem
+        img_buffer = io.BytesIO(img_bytes)
+        
+        # Executar OCR
+        result, _ = ocr(img_buffer.read())
         
         if not result:
-            return {}, ""
+            return {}, "OCR não conseguiu ler nenhum texto na imagem."
         
-        # Simular estrutura de linhas
-        lines_dict = defaultdict(list)
-        tolerance = 20
+        # Processamento simples do resultado do OCR
+        ocr_text = "\n".join([item[1] for item in result])
         
-        for item in result:
-            bbox, text, confidence = item
-            x0, y0 = bbox[0]
-            x1, y1 = bbox[2]
-            
-            found_line = False
-            for y_key in list(lines_dict.keys()):
-                if abs(y_key - y0) < tolerance:
-                    lines_dict[y_key].append({
-                        "text": text,
-                        "x0": x0,
-                        "y0": y0,
-                        "x1": x1,
-                        "y1": y1
-                    })
-                    found_line = True
-                    break
-            
-            if not found_line:
-                lines_dict[y0] = [{
-                    "text": text,
-                    "x0": x0,
-                    "y0": y0,
-                    "x1": x1,
-                    "y1": y1
-                }]
-        
-        # Criar estrutura similar ao PDF
-        sorted_lines = []
-        for y in sorted(lines_dict.keys()):
-            line_words = sorted(lines_dict[y], key=lambda w: w["x0"])
-            sorted_lines.append({
-                "y": y,
-                "words": line_words,
-                "text": " ".join([w["text"] for w in line_words])
-            })
-        
-        # Usar parser simples para OCR (menos preciso)
         data = {
             "nome_paciente": "",
             "nome_genitora": "",
@@ -401,103 +370,38 @@ def try_rapid_ocr(image_bytes: bytes):
             "municipio_referencia": "",
             "uf": "",
             "cep": "",
-            "hospital": "Maternidade Frei Justo Venture",
-            "telefone_unidade": HOSPITAIS["Maternidade Frei Justo Venture"],
-            "data": date.today(),
-            "hora": datetime.now().time().replace(microsecond=0),
             "diagnostico": "",
-            "peso": "",
-            "antecedente_transfusional": "Não",
-            "antecedentes_obstetricos": "Não",
-            "modalidade_transfusao": "Rotina",
         }
         
         # Mapeamento de padrões de rótulos para OCR
-        ocr_label_patterns = {
-            "nome_paciente": r"NOME\s+DO\s+PACIENTE",
-            "nome_genitora": r"NOME\s+DA\s+MÃE",
-            "cartao_sus": r"CNS",
-            "data_nascimento": r"DATA\s+DE\s+NASC",
-            "sexo": r"SEXO",
-            "raca": r"RAÇA",
-            "telefone_paciente": r"TELEFONE",
-            "prontuario": r"PRONTUÁRIO",
-            "endereco_completo": r"ENDEREÇO",
-            "municipio_referencia": r"MUNICÍPIO",
-            "uf": r"UF",
-            "cep": r"CEP",
+        ocr_patterns = {
+            "nome_paciente": r"Nome\s+do\s+Paciente\s*:\s*(.*)",
+            "nome_genitora": r"Nome\s+da\s+(Mãe|Mae)\s*:\s*(.*)",
+            "cartao_sus": r"CNS\s*:\s*(\d+)",
+            "data_nascimento": r"Data\s+de\s+Nasc\s*:\s*(\d{2}[^\d]?\d{2}[^\d]?\d{4})",
+            "prontuario": r"Prontuário\s*:\s*(\d+)",
+            "telefone_paciente": r"Telefone\s*:\s*([\d\s\-\(\)]+)",
+            "diagnostico": r"Diagnóstico\s*:\s*(.*)",
         }
         
-        # Simular extração simples por proximidade
-        for i, line in enumerate(sorted_lines):
-            line_text = line["text"].upper()
-            
-            # Tentar encontrar rótulo na linha atual
-            for field_name, pattern in ocr_label_patterns.items():
-                if re.search(pattern, line_text):
-                    # Se encontrou, o valor pode estar na mesma linha (após) ou na próxima
-                    
-                    # 1. Tentar na mesma linha (após o rótulo)
-                    match = re.search(pattern, line_text)
-                    value = line_text[match.end():].strip()
-                    
-                    if not value and i + 1 < len(sorted_lines):
-                        # 2. Tentar na próxima linha (se a atual não tiver valor)
-                        value = sorted_lines[i + 1]["text"].strip()
-                    
-                    if value:
-                        # Processar valor
-                        if field_name == "nome_paciente":
-                            data["nome_paciente"] = limpar_nome(value)
-                        
-                        elif field_name == "nome_genitora":
-                            data["nome_genitora"] = limpar_nome(value)
-                        
-                        elif field_name == "cartao_sus":
-                            digits = so_digitos(value)
-                            if len(digits) >= 15:
-                                data["cartao_sus"] = digits[:15]
-                            elif len(digits) >= 11:
-                                data["cartao_sus"] = digits
-                        
-                        elif field_name == "data_nascimento":
-                            data["data_nascimento"] = normaliza_data(value)
-                        
-                        elif field_name == "sexo":
-                            sexo_value = value.strip().upper()
-                            if "FEMININO" in sexo_value or "F" == sexo_value:
-                                data["sexo"] = "Feminino"
-                            elif "MASCULINO" in sexo_value or "M" == sexo_value:
-                                data["sexo"] = "Masculino"
-                        
-                        elif field_name == "raca":
-                            data["raca"] = value.strip().split()[0]
-                        
-                        elif field_name == "telefone_paciente":
-                            data["telefone_paciente"] = normaliza_telefone(value)
-                        
-                        elif field_name == "prontuario":
-                            data["prontuario"] = so_digitos(value)
-                        
-                        elif field_name == "endereco_completo":
-                            data["endereco_completo"] = value.strip()
-                        
-                        elif field_name == "municipio_referencia":
-                            data["municipio_referencia"] = limpar_nome(value)
-                        
-                        elif field_name == "uf":
-                            uf_match = re.search(r"\b([A-Z]{2})\b", value.upper())
-                            if uf_match:
-                                data["uf"] = uf_match.group(1)
-                        
-                        elif field_name == "cep":
-                            digits = so_digitos(value)
-                            if len(digits) >= 8:
-                                data["cep"] = f"{digits[:5]}-{digits[5:8]}"
-                            else:
-                                data["cep"] = digits
+        for field, pattern in ocr_patterns.items():
+            match = re.search(pattern, ocr_text, re.IGNORECASE)
+            if match:
+                value = match.group(1).strip()
+                if field == "nome_paciente" or field == "nome_genitora":
+                    data[field] = limpar_nome(value)
+                elif field == "cartao_sus":
+                    data[field] = so_digitos(value)
+                elif field == "data_nascimento":
+                    data[field] = normaliza_data(value)
+                elif field == "telefone_paciente":
+                    data[field] = normaliza_telefone(value)
+                elif field == "prontuario":
+                    data[field] = so_digitos(value)
+                elif field == "diagnostico":
+                    data[field] = value
         
-        return data, sorted_lines
+        return data, None
     
     except ImportError:
         return {}, "A biblioteca `rapidocr_onnxruntime` não está instalada. Por favor, adicione-a ao `requirements.txt`."
@@ -553,16 +457,21 @@ if uploaded:
     
     with st.spinner("🔍 Extraindo dados..."):
         if "pdf" in file_type:
-            pdf_bytes = uploaded.read()
-            extracted = parse_aih_tabular(pdf_bytes)
-            origem = "AIH"
+            try:
+                pdf_bytes = uploaded.read()
+                extracted = parse_aih_tabular(pdf_bytes)
+                origem = "AIH"
+            except Exception as e:
+                st.error(f"Erro ao processar PDF: {e}")
+                extracted = {}
+                origem = "Erro"
         else:
             img_bytes = uploaded.read()
             extracted, ocr_error = try_rapid_ocr(img_bytes)
             if ocr_error:
                 st.error(ocr_error)
                 extracted = {}
-            origem = "OCR"
+            origem = "OCR" if not ocr_error else "Erro"
         
         # Atualizar apenas campos não vazios
         for key, value in extracted.items():
@@ -570,7 +479,8 @@ if uploaded:
                 st.session_state.dados[key] = value
                 st.session_state.origem_dados[key] = origem
     
-    st.success(f"✅ Dados extraídos com sucesso via {origem}!")
+    if origem != "Erro":
+        st.success(f"✅ Dados extraídos com sucesso via {origem}!")
     
     # CORREÇÃO: Forçar o Streamlit a recriar os widgets do formulário
     # para que eles usem os novos valores de st.session_state.dados
