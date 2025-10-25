@@ -5,6 +5,7 @@ from collections import defaultdict
 
 import streamlit as st
 import fitz  # PyMuPDF
+import traceback
 
 # ----------------------------------------------------------
 # CONFIG GERAL (mobile-first) + CSS
@@ -462,7 +463,9 @@ if uploaded:
                 extracted = parse_aih_tabular(pdf_bytes)
                 origem = "AIH"
             except Exception as e:
-                st.error(f"Erro ao processar PDF: {e}")
+                st.error(f"Erro ao processar PDF. O Streamlit não travou, mas a extração falhou. Detalhes: {e}")
+                # Logar o erro completo para debug
+                st.exception(e)
                 extracted = {}
                 origem = "Erro"
         else:
