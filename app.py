@@ -18,29 +18,7 @@ def limpar_texto(txt: str) -> str:
 def so_digitos(txt: str) -> str:
     return re.sub(r"\D", "", txt or "")
 
-# === ADIÇÃO 1: PAINEL DE QUALIDADE ===
-LABEL_PATTERNS = { "LAUDO SOLICITAÇÃO INTERNAÇÃO": r"LAUDO\s+PARA\s+SOLICITA[ÇC][AÃ]O\s+DE\s+INTERNA[ÇC][AÃ]O", "Nome do Paciente": r"Nome\s*do\s*Paciente", "Nome da Mãe": r"Nome\s*da\s*M[ãa]e", "CNS": r"\bCNS\b", "Data de Nasc": r"Data\s*de\s*Nasc", "Endereço Residencial": r"Endere[çc]o\s*Residencial", "Município de Referência": r"Municipio\s*de\s*Refer[êe]ncia", "Diagnóstico Inicial": r"Diagn[oó]stico\s*Inicial", }
-
-def quality_score(text: str):
-    if not text: return 0, {}
-    found_labels = {label: bool(re.search(pattern, text, re.IGNORECASE)) for label, pattern in LABEL_PATTERNS.items()}
-    score = sum(found_labels.values()) / len(LABEL_PATTERNS)
-    return score, found_labels
-
-# === ADIÇÃO 2: PAINEL DE VALIDAÇÃO ===
-def validate_data(data: dict):
-    warnings = []
-    # Valida CNS
-    cns = data.get("cartao_sus", "")
-    if cns and len(so_digitos(cns)) != 15:
-        warnings.append(f"⚠️ **CNS inválido:** O valor '{cns}' não parece ter 15 dígitos.")
-    # Valida Data de Nascimento
-    data_nasc = data.get("data_nascimento", "")
-    if data_nasc and not re.match(r"\d{2}/\d{2}/\d{4}", data_nasc):
-        warnings.append(f"⚠️ **Data de Nascimento inválida:** O formato de '{data_nasc}' não é DD/MM/AAAA.")
-    return warnings
-
-# --- MOTORES DE ANÁLISE (NÃO MUDAM) ---
+# --- MOTORES DE ANÁLISE (A BASE ESTÁVEL) ---
 def parse_pdf_text(full_text: str):
     data = {}
     patterns = { "nome_paciente": r"Nome do Paciente\s+([A-ZÀ-ÿ\s]+?)\s+CNS", "cartao_sus": r"CNS\s+(\d{15})\s+", "nome_genitora": r"Nome da Mãe\s+([A-ZÀ-ÿ\s]+?)\s+Endereço Residencial", "data_nascimento": r"Data de Nasc\s+([\d/]+)\s+Sexo", "sexo": r"Sexo\s+(Feminino|Masculino)\s+Raça/cor", "raca": r"Raça/cor\s+([A-ZÀ-ÿ]+)\s+Nome do Responsável", "telefone_paciente": r"Telefone de Contato\s+([()\d\s-]+?)\s+Telefone Celular", "prontuario": r"Núm\. Prontuário\s+(\d+)\s+Telefone de Contato", "endereco_completo": r"Endereço Residencial \(Rua, Av etc\)\s+(.*?)\s+CPF", "municipio_referencia": r"Municipio de Referência\s+([A-ZÀ-ÿ\s]+?)\s+Cód\. IBGE", "uf": r"UF\s+([A-Z]{2})\s+CEP", "cep": r"CEP\s+([\d.-]+?)\s+Diretor Clinico", "diagnostico": r"Diagnóstico Inicial\s+(.*?)\s+CID 10 Principal", }
@@ -62,15 +40,31 @@ def parse_ocr_text(full_text: str):
     if data.get("cartao_sus"): data["cartao_sus"] = so_digitos(data["cartao_sus"])
     return data
 
-# --- PRÉ-PROCESSAMENTO E EXTRAÇÃO (A BASE QUE VOCÊ GOSTOU) ---
+# --- PRÉ-PROCESSAMENTO E EXTRAÇÃO (COM AS NOVAS ADIÇÕES) ---
 @st.cache_resource
 def get_ocr_model():
     return RapidOCR()
 
+def deskew(image: np.ndarray) -> np.ndarray:
+    """Função para corrigir a inclinação da imagem."""
+    coords = np.column_stack(np.where(image < 255))
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
 def preprocess_image_for_ocr(image_bytes: bytes) -> bytes:
+    """Aplica o pré-processamento completo, incluindo as novas adições."""
     try:
         pil_img = Image.open(io.BytesIO(image_bytes))
-        try: # Autorotação
+        # Autorotação
+        try:
             for orientation in ExifTags.TAGS.keys():
                 if ExifTags.TAGS[orientation] == 'Orientation': break
             exif = dict(pil_img._getexif().items())
@@ -81,7 +75,16 @@ def preprocess_image_for_ocr(image_bytes: bytes) -> bytes:
         
         img_array = np.array(pil_img.convert('RGB'))
         gray_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        processed_img = cv2.adaptiveThreshold(gray_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 15)
+        
+        # === ADIÇÃO 1: REMOÇÃO DE RUÍDO ===
+        denoised_img = cv2.fastNlMeansDenoising(gray_img, None, 10, 7, 21)
+
+        # === ADIÇÃO 2: CORREÇÃO DE INCLINAÇÃO (DESKEW) ===
+        deskewed_img = deskew(denoised_img)
+
+        # Binarização Adaptativa (que já tínhamos)
+        processed_img = cv2.adaptiveThreshold(deskewed_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 15)
+        
         _, buffer = cv2.imencode('.png', processed_img)
         return buffer.tobytes()
     except Exception:
@@ -101,10 +104,9 @@ def extract_text_from_image(image_bytes: bytes) -> str:
     full_text = re.sub(r"([A-Z]{2,})", r" \1", full_text)
     return re.sub(r'\s+', ' ', full_text).strip()
 
-# --- LÓGICA PRINCIPAL (COM ADIÇÕES) ---
+# --- LÓGICA PRINCIPAL DO APLICATIVO ---
 if "dados" not in st.session_state: st.session_state.dados = {}
 if "full_text_debug" not in st.session_state: st.session_state.full_text_debug = ""
-if "validation_warnings" not in st.session_state: st.session_state.validation_warnings = []
 
 st.title("Analisador de Laudo AIH")
 st.markdown("---")
@@ -125,14 +127,11 @@ if uploaded:
             
             st.session_state.full_text_debug = raw_text
             st.session_state.dados = extracted_data
-            
-            score, _ = quality_score(raw_text)
-            st.session_state.validation_warnings = validate_data(extracted_data)
 
             if any(extracted_data.values()):
-                st.success(f"✅ Documento analisado! Qualidade da Leitura: {score:.0%}")
+                st.success("✅ Documento analisado com sucesso!")
             else:
-                st.warning(f"⚠️ Arquivo lido, mas nenhum dado foi extraído. Qualidade da Leitura: {score:.0%}. Verifique o texto de debug.")
+                st.warning("⚠️ Arquivo lido, mas nenhum dado foi extraído. Verifique o texto de debug.")
         except Exception as e:
             st.error("Ocorreu um erro crítico ao processar o arquivo.")
             st.session_state.full_text_debug = traceback.format_exc()
@@ -141,19 +140,11 @@ if uploaded:
 def get_value(field, default=""):
     return st.session_state.dados.get(field, default)
 
-# ADIÇÃO 2: Exibe o painel de validação se houver alertas
-if st.session_state.validation_warnings:
-    st.markdown("---")
-    with st.container(border=True):
-        st.error("Atenção: Alguns dados podem precisar de revisão manual!")
-        for warning in st.session_state.validation_warnings:
-            st.markdown(warning)
-
 st.markdown("---")
 st.markdown("### 👤 Dados do Paciente")
-# (O resto do formulário é idêntico...)
 col1, col2 = st.columns(2); with col1: st.text_input("Nome do Paciente", get_value("nome_paciente")) 
 with col2: st.text_input("Nome da Mãe", get_value("nome_genitora"))
+# (O resto do formulário é idêntico...)
 st.markdown("---")
-with st.expander("🔍 Ver texto completo extraído e diagnóstico de qualidade"):
+with st.expander("🔍 Ver texto completo extraído (debug)"):
     st.code(st.session_state.get("full_text_debug", "Nenhum texto."), language="text")
