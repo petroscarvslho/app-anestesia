@@ -6,98 +6,148 @@ import traceback
 from rapidocr_onnxruntime import RapidOCR
 
 # --- CONFIGURAÇÃO E FUNÇÕES AUXILIARES ---
-st.set_page_config(page_title="Diagnóstico de Extração", layout="wide")
-st.title("🔬 Diagnóstico de Extração de Texto (Versão Segura)")
-st.info("Foco: Melhorar a extração de texto de PDFs e medir a qualidade da extração em ambos os formatos.")
+st.set_page_config(page_title="Analisador de Laudo AIH", layout="centered")
+st.markdown("""<style>.block-container {max-width: 740px !important; padding-top: 1.2rem;}</style>""", unsafe_allow_html=True)
 
 def limpar_texto(txt: str) -> str:
     return re.sub(r"\s+", " ", txt).strip() if txt else ""
 
-# --- MÉTRICAS DE QUALIDADE (IDEIA DO CHATGPT) ---
-# Rótulos-chave que esperamos encontrar em um formulário AIH
-LABEL_PATTERNS = {
-    "LAUDO SOLICITAÇÃO INTERNAÇÃO": r"LAUDO\s+PARA\s+SOLICITA[ÇC][AÃ]O\s+DE\s+INTERNA[ÇC][AÃ]O",
-    "Nome do Paciente": r"Nome\s+do\s+Paciente",
-    "Nome da Mãe": r"Nome\s+da\s+M[ãa]e",
-    "CNS": r"\bCNS\b",
-    "Data de Nasc": r"Data\s+de\s+Nasc",
-    "Endereço Residencial": r"Endere[çc]o\s+Residencial",
-    "Município de Referência": r"Munic[ií]pio\s+de\s+Refer[êe]ncia",
-    "Diagnóstico Inicial": r"Diagn[oó]stico\s+Inicial",
-    "Procedimento Solicitado": r"Procedimento\s+Solicitado",
-}
+def so_digitos(txt: str) -> str:
+    return re.sub(r"\D", "", txt or "")
 
-def quality_score(text: str):
-    """Calcula a porcentagem de rótulos-chave encontrados no texto."""
-    found_labels = {label: bool(re.search(pattern, text, re.IGNORECASE)) for label, pattern in LABEL_PATTERNS.items()}
-    score = sum(found_labels.values()) / len(LABEL_PATTERNS)
-    return score, found_labels
+# --- "MOTOR" DE ANÁLISE DE TEXTO PARA PDF (PRECISO) ---
+def parse_pdf_text(full_text: str):
+    data = {}
+    patterns = {
+        "nome_paciente": r"Nome do Paciente\s+([A-ZÀ-ÿ\s]+?)\s+CNS",
+        "cartao_sus": r"CNS\s+(\d{15})\s+",
+        "nome_genitora": r"Nome da Mãe\s+([A-ZÀ-ÿ\s]+?)\s+Endereço Residencial",
+        "data_nascimento": r"Data de Nasc\s+([\d/]+)\s+Sexo",
+        "sexo": r"Sexo\s+(Feminino|Masculino)\s+Raça/cor",
+        "raca": r"Raça/cor\s+([A-ZÀ-ÿ]+)\s+Nome do Responsável",
+        "telefone_paciente": r"Telefone de Contato\s+([()\d\s-]+?)\s+Telefone Celular",
+        "prontuario": r"Núm\. Prontuário\s+(\d+)\s+Telefone de Contato",
+        "endereco_completo": r"Endereço Residencial \(Rua, Av etc\)\s+(.*?)\s+CPF",
+        "municipio_referencia": r"Municipio de Referência\s+([A-ZÀ-ÿ\s]+?)\s+Cód\. IBGE",
+        "uf": r"UF\s+([A-Z]{2})\s+CEP",
+        "cep": r"CEP\s+([\d.-]+?)\s+Diretor Clinico",
+        "diagnostico": r"Diagnóstico Inicial\s+(.*?)\s+CID 10 Principal",
+    }
+    for field, pattern in patterns.items():
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match: data[field] = limpar_texto(match.group(1))
+            
+    if data.get("cartao_sus"): data["cartao_sus"] = so_digitos(data["cartao_sus"])
+    if data.get("cep"): data["cep"] = so_digitos(data["cep"])
+    return data
 
-# --- FUNÇÕES EXTRATORAS DE TEXTO (PDF MELHORADO) ---
+# --- "MOTOR" DE ANÁLISE DE TEXTO PARA OCR (ROBUSTO E FLEXÍVEL) ---
+def parse_ocr_text(full_text: str):
+    data = {}
+    # Regras que não dependem tanto de espaços perfeitos
+    patterns = {
+        "nome_paciente": r"Paciente\s*([A-ZÀ-ÿ\s]+?)\s*CNS",
+        "cartao_sus": r"CNS\s*(\d{15})",
+        "nome_genitora": r"Mae\s*([A-ZÀ-ÿ\s]+?)\s*Feminino|Mae\s*([A-ZÀ-ÿ\s]+?)\s*Endereco",
+        "data_nascimento": r"Nasc\s*([\d/]+)",
+        "sexo": r"(Feminino|Masculino)",
+        "raca": r"Raca/cor\s*([A-ZÀ-ÿ]+)",
+        "telefone_paciente": r"\((\d{2})\)\s?(\d{4,5}-\d{4})",
+        "prontuario": r"Prontuario\s*(\d+)",
+        "diagnostico": r"DiagnosticoInicial\s*(.*?)\s*CID",
+    }
+    for field, pattern in patterns.items():
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            # Pega o primeiro grupo de captura que não seja vazio
+            value = next((g for g in match.groups() if g is not None), None)
+            if value:
+                data[field] = limpar_texto(value)
+
+    if data.get("cartao_sus"): data["cartao_sus"] = so_digitos(data["cartao_sus"])
+    return data
+
+# --- FUNÇÕES EXTRATORAS DE TEXTO ---
 @st.cache_resource
 def get_ocr_model():
     return RapidOCR()
 
-def extract_text_from_pdf_improved(pdf_bytes: bytes) -> str:
-    """
-    VERSÃO MELHORADA: Usa 'blocks' para manter a estrutura de linhas, 
-    aumentando a qualidade do texto para análise.
-    """
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    full_text = ""
-    for page in doc:
-        blocks = sorted(page.get_text("blocks"), key=lambda b: b[1])
-        for block in blocks:
-            full_text += block[4].replace('\n', ' ').strip() + "\n"
-    # Limpa linhas vazias em excesso, mas mantém a estrutura
-    return re.sub(r'\n{2,}', '\n', full_text).strip()
+    full_text = " ".join(page.get_text(sort=True) for page in doc)
+    return re.sub(r'\s+', ' ', full_text).strip()
 
-def extract_text_from_image_simple(image_bytes: bytes) -> str:
-    """Mantém a extração de imagem simples e estável, sem OpenCV."""
+def extract_text_from_image(image_bytes: bytes) -> str:
     ocr = get_ocr_model()
     result, _ = ocr(image_bytes)
-    if not result: return "OCR não encontrou nenhum texto."
-    # Junta o texto do OCR com quebras de linha para simular um layout
-    full_text = "\n".join([item[1] for item in result])
-    return full_text.strip()
+    if not result: return ""
+    # Junta o texto do OCR em uma linha única, removendo espaços para corresponder ao padrão "sujo"
+    full_text = "".join([item[1] for item in result])
+    return full_text
 
-# --- INTERFACE DA FERRAMENTA DE DIAGNÓSTICO APRIMORADA ---
+# --- LÓGICA PRINCIPAL DO APLICATIVO ---
+if "dados" not in st.session_state: st.session_state.dados = {}
+if "full_text_debug" not in st.session_state: st.session_state.full_text_debug = "Nenhum arquivo carregado."
+
+st.title("Analisador de Laudo AIH")
 st.markdown("---")
-st.header("1. Teste de PDF (Extração Melhorada)")
-pdf_upload = st.file_uploader("Carregue um PDF", type="pdf", key="pdf_direct")
 
-if pdf_upload:
-    with st.spinner("Extraindo texto do PDF..."):
-        pdf_bytes = pdf_upload.read()
-        extracted_text = extract_text_from_pdf_improved(pdf_bytes)
-        score, found_labels = quality_score(extracted_text)
+uploaded = st.file_uploader("📤 Carregar Laudo (PDF ou Imagem)", type=["pdf", "png", "jpg", "jpeg"])
+
+if uploaded:
+    with st.spinner("🔍 Analisando documento..."):
+        try:
+            file_bytes = uploaded.read()
+            
+            if "pdf" in uploaded.type:
+                raw_text = extract_text_from_pdf(file_bytes)
+                extracted_data = parse_pdf_text(raw_text)
+            else:
+                raw_text = extract_text_from_image(file_bytes)
+                extracted_data = parse_ocr_text(raw_text)
+            
+            st.session_state.full_text_debug = raw_text
+            st.session_state.dados = extracted_data
+
+            if any(extracted_data.values()):
+                st.success("✅ Documento analisado com sucesso!")
+            else:
+                st.warning("⚠️ Arquivo lido, mas nenhum dado foi extraído. Verifique o texto de debug.")
         
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            st.text_area("📄 Texto Extraído (PDF)", extracted_text, height=300)
-        with col2:
-            st.metric("Cobertura de Rótulos", f"{score:.0%}")
-            st.write("**Rótulos Encontrados:**")
-            st.json({label: status for label, status in found_labels.items() if status})
-            st.write("**Rótulos Ausentes:**")
-            st.json({label: status for label, status in found_labels.items() if not status})
+        except Exception as e:
+            st.error("Ocorreu um erro crítico ao processar o arquivo.")
+            st.session_state.full_text_debug = traceback.format_exc()
+
+# --- INTERFACE DO FORMULÁRIO (RENDERIZAÇÃO) ---
+def get_value(field, default=""):
+    return st.session_state.dados.get(field, default)
 
 st.markdown("---")
-st.header("2. Teste de Imagem (Extração Simples)")
-image_upload = st.file_uploader("Carregue uma Imagem", type=["png", "jpg", "jpeg"], key="image_ocr")
+st.markdown("### 👤 Dados do Paciente")
 
-if image_upload:
-    with st.spinner("Analisando imagem com OCR..."):
-        image_bytes = image_upload.read()
-        extracted_text = extract_text_from_image_simple(image_bytes)
-        score, found_labels = quality_score(extracted_text)
-        
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            st.text_area("🖼️ Texto Extraído (Imagem)", extracted_text, height=300)
-        with col2:
-            st.metric("Cobertura de Rótulos", f"{score:.0%}")
-            st.write("**Rótulos Encontrados:**")
-            st.json({label: status for label, status in found_labels.items() if status})
-            st.write("**Rótulos Ausentes:**")
-            st.json({label: status for label, status in found_labels.items() if not status})
+col1, col2 = st.columns(2)
+with col1: st.text_input("Nome do Paciente", get_value("nome_paciente"), key="nome_paciente")
+with col2: st.text_input("Nome da Mãe", get_value("nome_genitora"), key="nome_genitora")
+# (O resto do formulário é o mesmo)
+col3, col4 = st.columns(2); col5, col6 = st.columns(2); col7, col8 = st.columns(2)
+with col3: st.text_input("CNS (Cartão SUS)", get_value("cartao_sus"), key="cartao_sus")
+with col4: st.text_input("Data de Nascimento", get_value("data_nascimento"), key="data_nascimento")
+with col5:
+    sexo_options = ["", "Feminino", "Masculino"]; sexo_val = get_value("sexo", "")
+    sexo_idx = sexo_options.index(sexo_val) if sexo_val in sexo_options else 0
+    st.selectbox("Sexo", sexo_options, index=sexo_idx, key="sexo")
+with col6: st.text_input("Raça/Cor", get_value("raca"), key="raca")
+with col7: st.text_input("Telefone de Contato", get_value("telefone_paciente"), key="telefone_paciente")
+with col8: st.text_input("Nº Prontuário", get_value("prontuario"), key="prontuario")
+st.markdown("---")
+st.markdown("### 📍 Endereço")
+st.text_area("Endereço Completo", get_value("endereco_completo"), key="endereco_completo", height=80)
+col9, col10, col11 = st.columns([2, 1, 1])
+with col9: st.text_input("Município", get_value("municipio_referencia"), key="municipio_referencia")
+with col10: st.text_input("UF", get_value("uf"), key="uf", max_chars=2)
+with col11: st.text_input("CEP", get_value("cep"), key="cep")
+st.markdown("---")
+st.markdown("### 🩺 Dados Clínicos")
+st.text_area("Diagnóstico Inicial", get_value("diagnostico"), key="diagnostico", height=100)
+with st.expander("🔍 Ver texto completo extraído (debug)"):
+    st.code(st.session_state.full_text_debug, language="text")
