@@ -4,229 +4,173 @@ from datetime import datetime, date, time
 import streamlit as st
 import fitz  # PyMuPDF
 import traceback
+from rapidocr_onnxruntime import RapidOCR
 
 # ----------------------------------------------------------
-# CONFIG GERAL (mobile-first) + CSS
+# CONFIGURAÇÃO DA PÁGINA E CSS
 # ----------------------------------------------------------
 st.set_page_config(page_title="Gerador de Ficha HEMOBA", layout="centered")
 MOBILE_CSS = """
 <style>
-.block-container {max-width: 740px !important; padding-top: 1.2rem;}
-h1,h2 { letter-spacing: -0.3px; }
-h3 { margin-top: 1.2rem; }
-.badge {display:inline-flex; align-items:center; gap:.4rem; font-size:.8rem; padding:.15rem .5rem; border-radius:999px; background:#eef2ff; color:#274 ; border:1px solid #dbeafe;}
-.badge .dot {width:.55rem;height:.55rem;border-radius:50%;}
-.dot-aih {background:#3b82f6;}
-.dot-ocr {background:#22c55e;}
-.dot-man {background:#cbd5e1;}
-.stTextInput > div > div > input,
-.stTextArea textarea { font-size: 16px !important; }
-label {font-weight:600}
-hr { border:none; height:1px; background:#eee; margin: 1.2rem 0;}
+.block-container {max-width: 740px !important; padding-top: 1.2rem;} h1,h2 { letter-spacing: -0.3px; } h3 { margin-top: 1.2rem; } .badge {display:inline-flex; align-items:center; gap:.4rem; font-size:.8rem; padding:.15rem .5rem; border-radius:999px; background:#eef2ff; color:#274 ; border:1px solid #dbeafe;} .badge .dot {width:.55rem;height:.55rem;border-radius:50%;} .dot-aih {background:#3b82f6;} .dot-ocr {background:#22c55e;} .dot-man {background:#cbd5e1;} .stTextInput > div > div > input, .stTextArea textarea { font-size: 16px !important; } label {font-weight:600} hr { border:none; height:1px; background:#eee; margin: 1.2rem 0;}
 </style>
 """
 st.markdown(MOBILE_CSS, unsafe_allow_html=True)
 
 # ----------------------------------------------------------
-# CONSTANTES
-# ----------------------------------------------------------
-HOSPITAIS = {
-    "Maternidade Frei Justo Venture": "(75) 3331-9400",
-    "Hospital Regional da Chapada Diamantina": "(75) 3331-9900",
-}
-
-# ----------------------------------------------------------
-# HELPERS DE LIMPEZA
+# FUNÇÕES AUXILIARES DE LIMPEZA
 # ----------------------------------------------------------
 def limpar_texto(txt: str) -> str:
     if not txt: return ""
-    # Remove múltiplos espaços e quebras de linha, mas mantém a estrutura básica
-    val = re.sub(r"(\s*\n\s*)+", " ", txt).strip()
-    val = re.sub(r"\s+", " ", val)
-    return val
+    return re.sub(r"\s+", " ", txt).strip()
 
 def so_digitos(txt: str) -> str:
     return re.sub(r"\D", "", txt or "")
 
-def normaliza_data(txt: str) -> str:
-    if not txt: return ""
-    m = re.search(r"(\d{2})[^\d]?(\d{2})[^\d]?(\d{4})", txt)
-    return f"{m.group(1)}/{m.group(2)}/{m.group(3)}" if m else ""
-
-def normaliza_telefone(txt: str) -> str:
-    if not txt: return ""
-    dig = so_digitos(txt)
-    if len(dig) == 11: return f"({dig[:2]}) {dig[2:7]}-{dig[7:]}"
-    if len(dig) == 10: return f"({dig[:2]}) {dig[2:6]}-{dig[6:]}"
-    return txt
-
 # ----------------------------------------------------------
-# EXTRAÇÃO DE DADOS DO PDF (LÓGICA CORRIGIDA)
+# O "MOTOR" DE ANÁLISE DE TEXTO (PARA PDF E IMAGEM)
 # ----------------------------------------------------------
-def parse_aih_simple(pdf_bytes: bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    full_text = "\n".join(page.get_text("text") for page in doc)
-    clean_text = re.sub(r"\s+", " ", full_text) # Texto limpo para regex
-
+def parse_form_text(full_text: str):
+    """
+    Recebe o texto bruto (de qualquer fonte) e aplica regras para extrair dados.
+    """
     data = {}
-    
-    # PADRÕES REGEX MAIS INTELIGENTES E FLEXÍVEIS
     patterns = {
-        "nome_paciente": r"(?:Nome\s+do\s+Paciente|PACIENTE)\s*[:\s]*(.*?)(?:Nome\s+da\s+Mãe|CNS|Prontuário|Endereço|Data\s+de\s+Nasc)",
-        "nome_genitora": r"Nome\s+da\s+(?:Mãe|Genitora)\s*[:\s]*(.*?)(?:CNS|Prontuário|Data\s+de\s+Nasc|Sexo)",
-        "cartao_sus": r"(?:CNS|Cartão\s+Nacional\s+de\s+Saúde|SUS)\s*[a-zA-Z\s]*[:\s]*([\d\s]{15,})",
-        "data_nascimento": r"Data\s+de\s+(?:Nasc|Nascimento)\s*[:\s]*(\d{2}/\d{2}/\d{4})",
-        "sexo": r"Sexo\s*[:\s]*(Feminino|Masculino|F|M)\b",
-        "raca": r"Raça/Cor\s*[:\s]*(.*?)(?:Telefone|Endereço)",
-        "telefone_paciente": r"Telefone\s*[:\s]*(\(?\d{2}\)?\s?\d{4,5}-?\d{4})",
-        "prontuario": r"Prontuário\s*[:\s]*(\d+)",
-        "endereco_completo": r"Endereço(?:.*?)[:\s]*(.*?)(?:Município|Bairro|CEP)",
-        "municipio_referencia": r"Município\s*[:\s]*(.*?)(?:UF|CEP)",
-        "uf": r"\bUF\s*[:\s]*([A-Z]{2})\b",
-        "cep": r"CEP\s*[:\s]*(\d{5}-?\d{3})",
-        "diagnostico": r"(?:Diagnóstico|Hipótese\s+Diagnóstica|HD)\s*[:\s]*(.*?)(?:Peso|Procedimento|Médico)",
-        "peso": r"Peso\s*\([Kk]g\)\s*[:\s]*([\d\.,]+)"
+        "nome_paciente": r"Nome do Paciente\s+([A-ZÀ-ÿ\s]+?)\s+CNS",
+        "cartao_sus": r"CNS\s+(\d{15})\s+",
+        "nome_genitora": r"Nome da Mãe\s+([A-ZÀ-ÿ\s]+?)\s+Endereço Residencial",
+        "data_nascimento": r"Data de Nasc\s+([\d/]+)\s+Sexo",
+        "sexo": r"Sexo\s+(Feminino|Masculino)\s+Raça/cor",
+        "raca": r"Raça/cor\s+([A-ZÀ-ÿ]+)\s+Nome do Responsável",
+        "telefone_paciente": r"Telefone de Contato\s+([()\d\s-]+?)\s+Telefone Celular",
+        "prontuario": r"Núm\. Prontuário\s+(\d+)\s+Telefone de Contato",
+        "endereco_completo": r"Endereço Residencial \(Rua, Av etc\)\s+(.*?)\s+CPF",
+        "municipio_referencia": r"Municipio de Referência\s+([A-ZÀ-ÿ\s]+?)\s+Cód\. IBGE",
+        "uf": r"UF\s+([A-Z]{2})\s+CEP",
+        "cep": r"CEP\s+([\d.-]+?)\s+Diretor Clinico",
+        "diagnostico": r"Diagnóstico Inicial\s+(.*?)\s+CID 10 Principal",
     }
     
     for field, pattern in patterns.items():
-        match = re.search(pattern, clean_text, re.IGNORECASE | re.DOTALL)
+        match = re.search(pattern, full_text, re.IGNORECASE)
         if match:
             value = match.group(1).strip()
-            if field in ["nome_paciente", "nome_genitora", "municipio_referencia", "diagnostico", "raca"]:
-                data[field] = limpar_texto(value)
-            elif field == "cartao_sus":
-                data[field] = so_digitos(value)
-            elif field == "data_nascimento":
-                data[field] = normaliza_data(value)
-            # Adicione outras normalizações se necessário
-            else:
-                data[field] = value
+            data[field] = limpar_texto(value)
+            
+    if data.get("cartao_sus"): data["cartao_sus"] = so_digitos(data["cartao_sus"])
+    if data.get("cep"): data["cep"] = so_digitos(data["cep"])
 
-    return data, full_text
+    return data
 
 # ----------------------------------------------------------
-# EXTRAÇÃO COM OCR (TAMBÉM MELHORADA)
+# FUNÇÕES EXTRATORAS DE TEXTO (UMA PARA CADA TIPO DE ARQUIVO)
 # ----------------------------------------------------------
-def try_rapid_ocr(img_bytes: bytes):
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        ocr = RapidOCR()
-        img_buffer = io.BytesIO(img_bytes)
-        result, _ = ocr(img_buffer.read())
-        
-        if not result:
-            return {}, "OCR não conseguiu ler o texto."
-        
-        ocr_text = "\n".join([item[1] for item in result])
-        # Reutiliza a mesma lógica de extração do PDF, que agora é mais robusta
-        pdf_like_bytes = ocr_text.encode('utf-8')
-        # Simula um PDF com o texto do OCR para usar o mesmo parser
-        return parse_aih_simple(pdf_like_bytes)
+@st.cache_resource
+def get_ocr_model():
+    # Carrega o modelo de OCR apenas uma vez para otimizar o desempenho
+    return RapidOCR()
 
-    except Exception as e:
-        st.error(f"Erro no OCR: {e}")
-        return {}, f"Erro no OCR: {e}\n{traceback.format_exc()}"
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    full_text = " ".join(page.get_text("text", flags=fitz.TEXTFLAGS_SEARCH).replace('\n', ' ') for page in doc)
+    return re.sub(r'\s+', ' ', full_text).strip()
+
+def extract_text_from_image(image_bytes: bytes) -> str:
+    ocr = get_ocr_model()
+    result, _ = ocr(image_bytes)
+    if not result: return ""
+    full_text = " ".join([item[1] for item in result])
+    return re.sub(r'\s+', ' ', full_text).strip()
 
 # ----------------------------------------------------------
-# INICIALIZAÇÃO E INTERFACE (O restante do código permanece igual)
+# LÓGICA PRINCIPAL DO APLICATIVO
 # ----------------------------------------------------------
+if "dados" not in st.session_state: st.session_state.dados = {}
+if "full_text_debug" not in st.session_state: st.session_state.full_text_debug = "Nenhum arquivo carregado."
 
-if "dados" not in st.session_state:
-    st.session_state.dados = {}
-if "origem_dados" not in st.session_state:
-    st.session_state.origem_dados = {}
-if "full_text_debug" not in st.session_state:
-    st.session_state.full_text_debug = "Nenhum arquivo carregado."
-
-st.title("Gerador de Ficha HEMOBA AIH")
+st.title("Analisador de Laudo AIH")
 st.markdown("---")
 
-uploaded = st.file_uploader(
-    "📤 Carregar AIH (PDF ou Imagem)",
-    type=["pdf", "jpg", "jpeg", "png"],
-    help="Faça o upload do Laudo para Solicitação de Internação Hospitalar"
-)
+uploaded = st.file_uploader("📤 Carregar Laudo (PDF ou Imagem)", type=["pdf", "png", "jpg", "jpeg"])
 
 if uploaded:
-    with st.spinner("🔍 Extraindo dados..."):
-        file_bytes = uploaded.read()
-        origem = "pdf" if "pdf" in uploaded.type else "ocr"
-        
+    with st.spinner("🔍 Analisando documento..."):
         try:
-            if origem == "pdf":
-                extracted_data, full_text = parse_aih_simple(file_bytes)
-            else:
-                extracted_data, full_text = try_rapid_ocr(file_bytes)
+            file_bytes = uploaded.read()
             
-            st.session_state.full_text_debug = full_text
-
-            # Atualiza o estado apenas com os dados encontrados
-            for key, value in extracted_data.items():
-                if value:
-                    st.session_state.dados[key] = value
-                    st.session_state.origem_dados[key] = "AIH" if origem == "pdf" else "OCR"
+            # Decide qual extrator usar baseado no tipo de arquivo
+            if "pdf" in uploaded.type:
+                raw_text = extract_text_from_pdf(file_bytes)
+            else:
+                raw_text = extract_text_from_image(file_bytes)
+            
+            st.session_state.full_text_debug = raw_text
+            
+            # Alimenta o texto extraído no "motor" de análise
+            extracted_data = parse_form_text(raw_text)
+            st.session_state.dados = extracted_data
 
             if any(extracted_data.values()):
-                st.success("✅ Dados extraídos com sucesso!")
+                st.success("✅ Documento analisado com sucesso!")
+                st.rerun()
             else:
-                st.warning("⚠️ Arquivo lido, mas nenhum dado foi encontrado. Verifique o texto de debug abaixo.")
+                st.warning("⚠️ Arquivo lido, mas nenhum dado foi extraído. Verifique o texto de debug.")
         
         except Exception as e:
-            st.error(f"Ocorreu um erro crítico ao processar o arquivo.")
+            st.error("Ocorreu um erro crítico ao processar o arquivo.")
             st.session_state.full_text_debug = traceback.format_exc()
 
-# O resto da sua interface (formulário) continua aqui.
-# ...
-# Este código assume que o resto da sua UI e geração de PDF estão corretos.
-# Apenas cole o resto do seu código a partir daqui.
-# O CÓDIGO ABAIXO COMPLETA O ARQUIVO
-def get_badge(field):
-    origem = st.session_state.origem_dados.get(field)
-    if origem == "AIH": return '<span class="badge"><span class="dot dot-aih"></span>AIH</span>'
-    if origem == "OCR": return '<span class="badge"><span class="dot dot-ocr"></span>OCR</span>'
-    return ''
-
-def get_value(field):
-    return st.session_state.dados.get(field, "")
+# ----------------------------------------------------------
+# INTERFACE DO FORMULÁRIO (RENDERIZAÇÃO)
+# ----------------------------------------------------------
+def get_value(field, default=""):
+    return st.session_state.dados.get(field, default)
 
 st.markdown("---")
 st.markdown("### 👤 Dados do Paciente")
+
 col1, col2 = st.columns(2)
 with col1:
-    st.markdown(f"**Nome do Paciente** {get_badge('nome_paciente')}", unsafe_allow_html=True)
-    st.session_state.dados["nome_paciente"] = st.text_input("Nome do Paciente", get_value("nome_paciente"), label_visibility="collapsed", key="input_nome_paciente")
+    st.text_input("Nome do Paciente", get_value("nome_paciente"), key="nome_paciente")
 with col2:
-    st.markdown(f"**Nome da Mãe/Genitora** {get_badge('nome_genitora')}", unsafe_allow_html=True)
-    st.session_state.dados["nome_genitora"] = st.text_input("Nome da Mãe", get_value("nome_genitora"), label_visibility="collapsed", key="input_nome_genitora")
+    st.text_input("Nome da Mãe", get_value("nome_genitora"), key="nome_genitora")
 
 col3, col4 = st.columns(2)
 with col3:
-    st.markdown(f"**CNS/Cartão SUS** {get_badge('cartao_sus')}", unsafe_allow_html=True)
-    st.session_state.dados["cartao_sus"] = st.text_input("CNS", get_value("cartao_sus"), label_visibility="collapsed", key="input_cartao_sus")
+    st.text_input("CNS (Cartão SUS)", get_value("cartao_sus"), key="cartao_sus")
 with col4:
-    st.markdown(f"**Data de Nascimento** {get_badge('data_nascimento')}", unsafe_allow_html=True)
-    st.session_state.dados["data_nascimento"] = st.text_input("Data de Nascimento", get_value("data_nascimento"), label_visibility="collapsed", key="input_data_nascimento", placeholder="DD/MM/AAAA")
+    st.text_input("Data de Nascimento", get_value("data_nascimento"), key="data_nascimento")
 
 col5, col6 = st.columns(2)
 with col5:
-    st.markdown(f"**Sexo** {get_badge('sexo')}", unsafe_allow_html=True)
     sexo_options = ["", "Feminino", "Masculino"]
-    sexo_idx = sexo_options.index(get_value("sexo")) if get_value("sexo") in sexo_options else 0
-    st.session_state.dados["sexo"] = st.selectbox("Sexo", sexo_options, index=sexo_idx, label_visibility="collapsed", key="input_sexo")
+    sexo_val = get_value("sexo", "")
+    sexo_idx = sexo_options.index(sexo_val) if sexo_val in sexo_options else 0
+    st.selectbox("Sexo", sexo_options, index=sexo_idx, key="sexo")
 with col6:
-    st.markdown(f"**Raça/Cor** {get_badge('raca')}", unsafe_allow_html=True)
-    st.session_state.dados["raca"] = st.text_input("Raça/Cor", get_value("raca"), label_visibility="collapsed", key="input_raca")
+    st.text_input("Raça/Cor", get_value("raca"), key="raca")
+
+col7, col8 = st.columns(2)
+with col7:
+    st.text_input("Telefone de Contato", get_value("telefone_paciente"), key="telefone_paciente")
+with col8:
+    st.text_input("Nº Prontuário", get_value("prontuario"), key="prontuario")
+
+st.markdown("---")
+st.markdown("### 📍 Endereço")
+st.text_area("Endereço Completo", get_value("endereco_completo"), key="endereco_completo", height=80)
+
+col9, col10, col11 = st.columns([2, 1, 1])
+with col9:
+    st.text_input("Município", get_value("municipio_referencia"), key="municipio_referencia")
+with col10:
+    st.text_input("UF", get_value("uf"), key="uf", max_chars=2)
+with col11:
+    st.text_input("CEP", get_value("cep"), key="cep")
 
 st.markdown("---")
 st.markdown("### 🩺 Dados Clínicos")
-st.markdown(f"**Diagnóstico** {get_badge('diagnostico')}", unsafe_allow_html=True)
-st.session_state.dados["diagnostico"] = st.text_area("Diagnóstico", get_value("diagnostico"), key="input_diagnostico", height=80, label_visibility="collapsed")
+st.text_area("Diagnóstico Inicial", get_value("diagnostico"), key="diagnostico", height=100)
 
-# Adicione outros campos do formulário aqui...
-
-# Debug
-with st.expander("🔍 Ver dados extraídos (debug)"):
-    st.markdown("#### Texto Completo Extraído do PDF/OCR (Para Debug)")
+with st.expander("🔍 Ver texto completo extraído (debug)"):
     st.code(st.session_state.full_text_debug, language="text")
-    st.markdown("#### JSON dos Itens Extraídos")
-    st.json(st.session_state.dados)
