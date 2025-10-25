@@ -31,9 +31,6 @@ def so_digitos(txt: str) -> str:
 # O "MOTOR" DE ANÁLISE DE TEXTO (PARA PDF E IMAGEM)
 # ----------------------------------------------------------
 def parse_form_text(full_text: str):
-    """
-    Recebe o texto bruto (de qualquer fonte) e aplica regras para extrair dados.
-    """
     data = {}
     patterns = {
         "nome_paciente": r"Nome do Paciente\s+([A-ZÀ-ÿ\s]+?)\s+CNS",
@@ -67,7 +64,6 @@ def parse_form_text(full_text: str):
 # ----------------------------------------------------------
 @st.cache_resource
 def get_ocr_model():
-    # Carrega o modelo de OCR apenas uma vez para otimizar o desempenho
     return RapidOCR()
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
@@ -98,15 +94,12 @@ if uploaded:
         try:
             file_bytes = uploaded.read()
             
-            # Decide qual extrator usar baseado no tipo de arquivo
             if "pdf" in uploaded.type:
                 raw_text = extract_text_from_pdf(file_bytes)
             else:
                 raw_text = extract_text_from_image(file_bytes)
             
             st.session_state.full_text_debug = raw_text
-            
-            # Alimenta o texto extraído no "motor" de análise
             extracted_data = parse_form_text(raw_text)
             st.session_state.dados = extracted_data
 
