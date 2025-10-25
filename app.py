@@ -43,6 +43,7 @@ HOSPITAIS = {
 def limpar_nome(txt: str) -> str:
     if not txt:
         return ""
+    # Remove caracteres que não são letras, espaços, apóstrofos ou hífens
     partes = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s'.-]+", txt)
     val = " ".join(partes).strip()
     val = re.sub(r"\s+", " ", val)
@@ -71,105 +72,20 @@ def normaliza_telefone(txt: str) -> str:
     return txt
 
 # ----------------------------------------------------------
-# EXTRAÇÃO COM PARSER TABULAR
+# EXTRAÇÃO SIMPLIFICADA (MAIS ROBUSTA)
 # ----------------------------------------------------------
-def extract_pdf_with_words(pdf_bytes: bytes):
-    """Extrai palavras com posições do PDF"""
+def parse_aih_simple(pdf_bytes: bytes):
+    """Parser simplificado que extrai todo o texto e usa regex"""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]
-    words = page.get_text("words")
+    text = ""
+    for page in doc:
+        # Extrai o texto de todas as páginas
+        text += page.get_text("text")
     
-    # Organizar por linha
-    lines = defaultdict(list)
-    tolerance = 5
-    
-    for word in words:
-        x0, y0, x1, y1, text, block_no, line_no, word_no = word
-        
-        found_line = False
-        for y_key in list(lines.keys()):
-            if abs(y_key - y0) < tolerance:
-                lines[y_key].append({
-                    "text": text,
-                    "x0": x0,
-                    "y0": y0,
-                    "x1": x1,
-                    "y1": y1
-                })
-                found_line = True
-                break
-        
-        if not found_line:
-            lines[y0] = [{
-                "text": text,
-                "x0": x0,
-                "y0": y0,
-                "x1": x1,
-                "y1": y1
-            }]
-    
-    # Ordenar
-    sorted_lines = []
-    for y in sorted(lines.keys()):
-        line_words = sorted(lines[y], key=lambda w: w["x0"])
-        sorted_lines.append({
-            "y": y,
-            "words": line_words,
-            "text": " ".join([w["text"] for w in line_words])
-        })
-    
-    return sorted_lines
-
-def match_value_to_label_by_position(label_words, value_line_words, label_text):
-    """
-    Encontra o valor que corresponde a um rótulo baseado em posição X
-    """
-    if not label_words or not value_line_words:
-        return ""
-    
-    # Calcular posição X média do rótulo
-    label_x_start = label_words[0]["x0"]
-    label_x_end = label_words[-1]["x1"]
-    label_x_center = (label_x_start + label_x_end) / 2
-    
-    # Encontrar palavras da linha de valor que estão alinhadas com o rótulo
-    aligned_words = []
-    tolerance = 80  # pixels de tolerância
-    
-    for word in value_line_words:
-        word_x_center = (word["x0"] + word["x1"]) / 2
-        
-        # Verificar se está alinhado
-        if abs(word_x_center - label_x_center) < tolerance:
-            aligned_words.append(word)
-        # Ou se começa próximo ao início do rótulo
-        elif abs(word["x0"] - label_x_start) < tolerance:
-            aligned_words.append(word)
-    
-    # Se não encontrou alinhado, pegar palavras que começam após o rótulo
-    if not aligned_words:
-        for word in value_line_words:
-            if word["x0"] >= label_x_start - 20:  # pequena margem
-                aligned_words.append(word)
-    
-    # Ordenar por posição X e juntar
-    aligned_words.sort(key=lambda w: w["x0"])
-    
-    # Limitar ao próximo rótulo (não pegar valores de outras colunas)
-    result_words = []
-    last_word_obj = None
-    for word in aligned_words:
-        # Parar se encontrar palavra que parece ser outro campo
-        if last_word_obj and word["x0"] > last_word_obj["x1"] + 100:
-            break
-        result_words.append(word["text"])
-        last_word_obj = word
-    
-    return " ".join(result_words)
-
-def parse_aih_tabular(pdf_bytes: bytes):
-    """Parser inteligente que entende layout tabular"""
-    lines = extract_pdf_with_words(pdf_bytes)
+    # Versão com quebra de linha para visualização
+    full_text = text.strip() 
+    # Versão limpa (sem quebras de linha e múltiplos espaços) para o regex
+    clean_text = re.sub(r"\s+", " ", full_text).strip()
     
     data = {
         "nome_paciente": "",
@@ -195,145 +111,54 @@ def parse_aih_tabular(pdf_bytes: bytes):
         "modalidade_transfusao": "Rotina",
     }
     
-    # Mapeamento de padrões de rótulos
-    label_patterns = {
-        "nome_paciente": r"Nome\s+do\s+Paciente",
-        "nome_genitora": r"Nome\s+da\s+(Mãe|Mae)",
-        "nome_responsavel": r"Nome\s+do\s+Responsável",
-        "cartao_sus": r"^CNS$",
-        "data_nascimento": r"Data\s+de\s+Nasc",
-        "sexo": r"^Sexo$",
-        "raca": r"Raça[/]?[Cc]or",
-        "telefone_contato": r"Telefone\s+de\s+Contato",
-        "telefone_celular": r"Telefone\s+Celular",
-        "prontuario": r"(Núm\.|Num\.)\s*Prontuário",
-        "atendimento": r"^Atendimento$",
-        "endereco": r"Endereço\s+Residencial",
-        "municipio": r"Munic[íi]pio\s+de\s+Refer[êe]ncia",
-        "uf": r"^UF$",
-        "cep": r"^CEP$",
-        "cpf": r"^CPF$",
+    # Padrões Regex (mais tolerantes a espaços e pontuações)
+    # Grupo 1: O valor que queremos extrair
+    patterns = {
+        "nome_paciente": r"Nome\s+do\s+Paciente\s*[:\s]*(.*?)(?:Nome\s+da\s+Mãe|CNS|Prontuário|$)",
+        "nome_genitora": r"Nome\s+da\s+(Mãe|Mae)\s*[:\s]*(.*?)(?:CNS|Prontuário|Data\s+de\s+Nasc|$)",
+        "cartao_sus": r"CNS\s*[/\s]*Cartão\s+SUS\s*[:\s]*(\d+)",
+        "data_nascimento": r"Data\s+de\s+Nasc\s*[:\s]*(\d{2}[^\d]?\d{2}[^\d]?\d{4})",
+        "sexo": r"Sexo\s*[:\s]*(Feminino|Masculino|F|M)",
+        "raca": r"Raça\s*[/\s]*Cor\s*[:\s]*(.*?)(?:Telefone|Prontuário|$)",
+        "telefone_paciente": r"Telefone\s*[:\s]*([\d\s\-\(\)]+)",
+        "prontuario": r"Prontuário\s*[:\s]*(\d+)",
+        "endereco_completo": r"Endereço\s+Completo\s*[:\s]*(.*?)(?:Município|UF|CEP|$)",
+        "municipio_referencia": r"Município\s*[:\s]*(.*?)(?:UF|CEP|$)",
+        "uf": r"UF\s*[:\s]*([A-Z]{2})",
+        "cep": r"CEP\s*[:\s]*(\d{5}[-\s]?\d{3})",
+        "diagnostico": r"Diagnóstico\s*[:\s]*(.*?)(?:Peso|Antecedente|$)",
+        "peso": r"Peso\s*\([Kk]g\)\s*[:\s]*([\d\.,]+)",
     }
     
-    # Processar cada linha
-    for i, line in enumerate(lines):
-        line_text = line["text"]
-        
-        # Verificar se é linha de rótulos (contém múltiplos campos conhecidos)
-        matches = []
-        for field_name, pattern in label_patterns.items():
-            for match in re.finditer(pattern, line_text, re.IGNORECASE):
-                # Encontrar palavras que compõem este rótulo
-                label_words = []
-                match_start = match.start()
-                match_end = match.end()
-                
-                char_pos = 0
-                for word in line["words"]:
-                    word_len = len(word["text"])
-                    word_start = char_pos
-                    word_end = char_pos + word_len
-                    
-                    # Se palavra está dentro do match
-                    if word_end > match_start and word_start < match_end:
-                        label_words.append(word)
-                    
-                    char_pos = word_end + 1  # +1 para espaço
-                
-                matches.append({
-                    "field": field_name,
-                    "label": match.group(0),
-                    "words": label_words,
-                    "match": match
-                })
-        
-        # Se encontrou rótulos, próxima linha tem valores
-        if matches and i + 1 < len(lines):
-            value_line = lines[i + 1]
+    for field, pattern in patterns.items():
+        match = re.search(pattern, clean_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            value = match.group(1).strip()
             
-            for match_info in matches:
-                field = match_info["field"]
-                label_words = match_info["words"]
-                
-                # Extrair valor alinhado
-                value = match_value_to_label_by_position(
-                    label_words,
-                    value_line["words"],
-                    match_info["label"]
-                )
-                
-                # Processar valor
-                if field == "nome_paciente":
-                    data["nome_paciente"] = limpar_nome(value)
-                
-                elif field == "nome_genitora":
-                    # Nome da mãe pode vir junto com nome do responsável
-                    # Pegar apenas a primeira parte (antes de outro nome próprio longo)
-                    parts = value.split()
-                    # Pegar até 4 palavras (nome completo típico)
-                    if len(parts) > 4:
-                        value = " ".join(parts[:4])
-                    data["nome_genitora"] = limpar_nome(value)
-                
-                elif field == "nome_responsavel":
-                    # Se nome da mãe ainda vazio, usar responsável
-                    if not data["nome_genitora"]:
-                        data["nome_genitora"] = limpar_nome(value)
-                
-                elif field == "cartao_sus":
-                    digits = so_digitos(value)
-                    if len(digits) >= 15:
-                        data["cartao_sus"] = digits[:15]
-                    elif len(digits) >= 11:
-                        data["cartao_sus"] = digits
-                
-                elif field == "data_nascimento":
-                    data["data_nascimento"] = normaliza_data(value)
-                
-                elif field == "sexo":
-                    if re.search(r"fem", value, re.IGNORECASE):
-                        data["sexo"] = "Feminino"
-                    elif re.search(r"masc", value, re.IGNORECASE):
-                        data["sexo"] = "Masculino"
-                
-                elif field == "raca":
-                    data["raca"] = limpar_nome(value)
-                
-                elif field == "prontuario":
-                    data["prontuario"] = so_digitos(value)
-                
-                elif field in ["telefone_contato", "telefone_celular"]:
-                    if not data["telefone_paciente"]:
-                        data["telefone_paciente"] = normaliza_telefone(value)
-                
-                elif field == "endereco":
-                    # Endereço é um campo longo, pegar a linha inteira
-                    data["endereco_completo"] = line_text.replace(match_info["label"], "").strip()
-                    # Se a linha de valor for mais completa, usar ela
-                    if value_line["text"]:
-                        data["endereco_completo"] = value_line["text"]
-                
-                elif field == "municipio":
-                    data["municipio_referencia"] = limpar_nome(value)
-                
-                elif field == "uf":
-                    data["uf"] = limpar_nome(value)[:2].upper()
-                
-                elif field == "cep":
-                    data["cep"] = so_digitos(value)[:8]
-                
+            if field in ["nome_paciente", "nome_genitora", "municipio_referencia", "raca"]:
+                data[field] = limpar_nome(value)
+            elif field == "cartao_sus" or field == "prontuario":
+                data[field] = so_digitos(value)
+            elif field == "data_nascimento":
+                data["data_nascimento"] = normaliza_data(value)
+            elif field == "telefone_paciente":
+                data["telefone_paciente"] = normaliza_telefone(value)
+            elif field == "sexo":
+                if re.search(r"fem|f", value, re.IGNORECASE):
+                    data["sexo"] = "Feminino"
+                elif re.search(r"masc|m", value, re.IGNORECASE):
+                    data["sexo"] = "Masculino"
+            elif field == "uf":
+                data["uf"] = value.upper()
+            elif field == "cep":
+                data["cep"] = so_digitos(value)
+            elif field == "peso":
+                data["peso"] = value.replace(",", ".")
+            else:
+                data[field] = value
     
-    # Tentativa de extrair diagnóstico (se houver)
-    for line in lines:
-        if re.search(r"diagnóstico", line["text"], re.IGNORECASE):
-            # Tenta pegar a linha seguinte como diagnóstico
-            try:
-                diag_line = lines[lines.index(line) + 1]
-                data["diagnostico"] = diag_line["text"]
-            except IndexError:
-                pass
-
-    return data
+    # Retorna os dados extraídos e o texto completo para debug
+    return data, full_text
 
 # ----------------------------------------------------------
 # EXTRAÇÃO COM OCR
@@ -346,7 +171,6 @@ def try_rapid_ocr(img_bytes: bytes):
         ocr = RapidOCR()
         
         # O RapidOCR espera um caminho de arquivo ou bytes
-        # Criar um buffer para a imagem
         img_buffer = io.BytesIO(img_bytes)
         
         # Executar OCR
@@ -402,7 +226,7 @@ def try_rapid_ocr(img_bytes: bytes):
                 elif field == "diagnostico":
                     data[field] = value
         
-        return data, None
+        return data, ocr_text # Retorna o texto OCR para debug
     
     except ImportError:
         return {}, "A biblioteca `rapidocr_onnxruntime` não está instalada. Por favor, adicione-a ao `requirements.txt`."
@@ -439,6 +263,8 @@ if "dados" not in st.session_state:
     }
 if "origem_dados" not in st.session_state:
     st.session_state.origem_dados = {}
+if "full_text_debug" not in st.session_state:
+    st.session_state.full_text_debug = "Nenhum texto extraído ainda."
 
 # ----------------------------------------------------------
 # INTERFACE
@@ -457,25 +283,29 @@ if uploaded:
     file_type = uploaded.type
     
     with st.spinner("🔍 Extraindo dados..."):
+        extracted = {}
+        origem = "Erro"
+        
         if "pdf" in file_type:
             try:
                 pdf_bytes = uploaded.read()
-                extracted = parse_aih_tabular(pdf_bytes)
+                extracted, full_text = parse_aih_simple(pdf_bytes)
                 origem = "AIH"
+                st.session_state.full_text_debug = full_text
             except Exception as e:
-                st.error(f"Erro ao processar PDF. O Streamlit não travou, mas a extração falhou. Detalhes: {e}")
-                # Logar o erro completo para debug
+                st.error(f"Erro ao processar PDF. Detalhes: {e}")
                 st.exception(e)
-                extracted = {}
-                origem = "Erro"
+                st.session_state.full_text_debug = f"ERRO: {e}\n{traceback.format_exc()}"
         else:
             img_bytes = uploaded.read()
-            extracted, ocr_error = try_rapid_ocr(img_bytes)
-            if ocr_error:
-                st.error(ocr_error)
-                extracted = {}
-            origem = "OCR" if not ocr_error else "Erro"
-        
+            extracted, ocr_output = try_rapid_ocr(img_bytes)
+            if isinstance(ocr_output, str) and ocr_output.startswith("Erro"):
+                st.error(ocr_output)
+                st.session_state.full_text_debug = ocr_output
+            else:
+                origem = "OCR"
+                st.session_state.full_text_debug = ocr_output
+
         # Atualizar apenas campos não vazios
         for key, value in extracted.items():
             if value and value != "":
@@ -486,7 +316,6 @@ if uploaded:
         st.success(f"✅ Dados extraídos com sucesso via {origem}!")
     
     # CORREÇÃO: Forçar o Streamlit a recriar os widgets do formulário
-    # para que eles usem os novos valores de st.session_state.dados
     st.rerun()
 
 # Helper para badges
@@ -809,5 +638,8 @@ if st.button("🔽 Gerar PDF da Ficha HEMOBA", type="primary", use_container_wid
 
 # Debug
 with st.expander("🔍 Ver dados extraídos (debug)"):
+    st.markdown("#### Texto Completo Extraído do PDF/OCR (Para Debug)")
+    st.code(st.session_state.full_text_debug, language="text")
+    st.markdown("#### JSON dos Itens Extraídos")
     st.json(st.session_state.dados)
     st.json(st.session_state.origem_dados)
