@@ -46,12 +46,12 @@ def parse_ocr_text(full_text: str):
     data = {}
     # Regras que não dependem tanto de espaços perfeitos
     patterns = {
-        "nome_paciente": r"Paciente\s*([A-ZÀ-ÿ\s]+?)\s*CNS",
+        "nome_paciente": r"Paciente\s*([A-Z\s]+?)\s*CNS",
         "cartao_sus": r"CNS\s*(\d{15})",
-        "nome_genitora": r"Mae\s*([A-ZÀ-ÿ\s]+?)\s*Feminino|Mae\s*([A-ZÀ-ÿ\s]+?)\s*Endereco",
+        "nome_genitora": r"Mae\s*([A-Z\s]+?)\s*Feminino|Mae\s*([A-Z\s]+?)\s*Endereco",
         "data_nascimento": r"Nasc\s*([\d/]+)",
         "sexo": r"(Feminino|Masculino)",
-        "raca": r"Raca/cor\s*([A-ZÀ-ÿ]+)",
+        "raca": r"Raca/cor\s*([A-Z]+)",
         "telefone_paciente": r"\((\d{2})\)\s?(\d{4,5}-\d{4})",
         "prontuario": r"Prontuario\s*(\d+)",
         "diagnostico": r"DiagnosticoInicial\s*(.*?)\s*CID",
@@ -59,10 +59,8 @@ def parse_ocr_text(full_text: str):
     for field, pattern in patterns.items():
         match = re.search(pattern, full_text, re.IGNORECASE)
         if match:
-            # Pega o primeiro grupo de captura que não seja vazio
             value = next((g for g in match.groups() if g is not None), None)
-            if value:
-                data[field] = limpar_texto(value)
+            if value: data[field] = limpar_texto(value)
 
     if data.get("cartao_sus"): data["cartao_sus"] = so_digitos(data["cartao_sus"])
     return data
@@ -83,6 +81,8 @@ def extract_text_from_image(image_bytes: bytes) -> str:
     if not result: return ""
     # Junta o texto do OCR em uma linha única, removendo espaços para corresponder ao padrão "sujo"
     full_text = "".join([item[1] for item in result])
+    # Adiciona espaços antes de palavras que começam com maiúscula para ajudar a separar
+    full_text = re.sub(r"([A-Z][a-z]+)", r" \1", full_text).strip()
     return full_text
 
 # --- LÓGICA PRINCIPAL DO APLICATIVO ---
