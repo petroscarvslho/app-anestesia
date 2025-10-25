@@ -5,33 +5,19 @@ import fitz  # PyMuPDF
 import traceback
 from rapidocr_onnxruntime import RapidOCR
 
-# ----------------------------------------------------------
-# CONFIGURAÇÃO DA PÁGINA E CSS (NÃO MUDA)
-# ----------------------------------------------------------
+# --- CONFIGURAÇÃO E FUNÇÕES AUXILIARES (NÃO MUDA) ---
 st.set_page_config(page_title="Analisador de Laudo AIH", layout="centered")
-MOBILE_CSS = """
-<style>
-.block-container {max-width: 740px !important; padding-top: 1.2rem;} h1,h2 { letter-spacing: -0.3px; } h3 { margin-top: 1.2rem; }
-</style>
-"""
-st.markdown(MOBILE_CSS, unsafe_allow_html=True)
+st.markdown("""<style>.block-container {max-width: 740px !important; padding-top: 1.2rem;}</style>""", unsafe_allow_html=True)
 
-# ----------------------------------------------------------
-# FUNÇÕES AUXILIARES DE LIMPEZA (NÃO MUDAM)
-# ----------------------------------------------------------
 def limpar_texto(txt: str) -> str:
-    if not txt: return ""
-    return re.sub(r"\s+", " ", txt).strip()
+    return re.sub(r"\s+", " ", txt).strip() if txt else ""
 
 def so_digitos(txt: str) -> str:
     return re.sub(r"\D", "", txt or "")
 
-# ----------------------------------------------------------
-# O "MOTOR" DE ANÁLISE DE TEXTO (REGRAS AJUSTADAS)
-# ----------------------------------------------------------
-def parse_form_text(full_text: str):
+# --- "MOTOR" DE ANÁLISE DE TEXTO PARA PDF (PRECISO) ---
+def parse_pdf_text(full_text: str):
     data = {}
-    # Regras ajustadas para serem mais robustas com o texto ordenado
     patterns = {
         "nome_paciente": r"Nome do Paciente\s+([A-ZÀ-ÿ\s]+?)\s+CNS",
         "cartao_sus": r"CNS\s+(\d{15})\s+",
@@ -47,31 +33,41 @@ def parse_form_text(full_text: str):
         "cep": r"CEP\s+([\d.-]+?)\s+Diretor Clinico",
         "diagnostico": r"Diagnóstico Inicial\s+(.*?)\s+CID 10 Principal",
     }
-    
     for field, pattern in patterns.items():
         match = re.search(pattern, full_text, re.IGNORECASE)
-        if match:
-            value = match.group(1).strip()
-            data[field] = limpar_texto(value)
+        if match: data[field] = limpar_texto(match.group(1))
             
     if data.get("cartao_sus"): data["cartao_sus"] = so_digitos(data["cartao_sus"])
     if data.get("cep"): data["cep"] = so_digitos(data["cep"])
-
     return data
 
-# ----------------------------------------------------------
-# FUNÇÕES EXTRATORAS DE TEXTO (MUDANÇA CRÍTICA AQUI!)
-# ----------------------------------------------------------
+# --- "MOTOR" DE ANÁLISE DE TEXTO PARA OCR (FLEXÍVEL) ---
+def parse_ocr_text(full_text: str):
+    data = {}
+    patterns = {
+        "nome_paciente": r"Paciente\s+([A-ZÀ-ÿ\s]+?)\s+CNS",
+        "cartao_sus": r"CNS\s+(\d{15})\s+",
+        "data_nascimento": r"Nasc\s+([\d/]+)",
+        "sexo": r"(Feminino|Masculino)",
+        "telefone_paciente": r"\((\d{2})\)\s?(\d{4,5}-\d{4})",
+    }
+    for field, pattern in patterns.items():
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            if field == "telefone_paciente":
+                data[field] = f"({match.group(1)}) {match.group(2)}"
+            else:
+                data[field] = limpar_texto(match.group(1))
+
+    if data.get("cartao_sus"): data["cartao_sus"] = so_digitos(data["cartao_sus"])
+    return data
+
+# --- FUNÇÕES EXTRATORAS DE TEXTO ---
 @st.cache_resource
 def get_ocr_model():
     return RapidOCR()
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """
-    VERSÃO CORRIGIDA: Usa o método 'sort=True' do PyMuPDF, que organiza o texto
-    em uma ordem de leitura natural (de cima para baixo, esquerda para a direita).
-    Isso evita o embaralhamento de palavras.
-    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     full_text = ""
     for page in doc:
@@ -82,13 +78,10 @@ def extract_text_from_image(image_bytes: bytes) -> str:
     ocr = get_ocr_model()
     result, _ = ocr(image_bytes)
     if not result: return ""
-    # Junta o resultado do OCR em uma linha única, que é como o extrator de PDF agora funciona
     full_text = " ".join([item[1] for item in result])
     return re.sub(r'\s+', ' ', full_text).strip()
 
-# ----------------------------------------------------------
-# LÓGICA PRINCIPAL DO APLICATIVO (SEM st.rerun())
-# ----------------------------------------------------------
+# --- LÓGICA PRINCIPAL DO APLICATIVO ---
 if "dados" not in st.session_state: st.session_state.dados = {}
 if "full_text_debug" not in st.session_state: st.session_state.full_text_debug = "Nenhum arquivo carregado."
 
@@ -104,11 +97,12 @@ if uploaded:
             
             if "pdf" in uploaded.type:
                 raw_text = extract_text_from_pdf(file_bytes)
+                extracted_data = parse_pdf_text(raw_text)
             else:
                 raw_text = extract_text_from_image(file_bytes)
+                extracted_data = parse_ocr_text(raw_text)
             
             st.session_state.full_text_debug = raw_text
-            extracted_data = parse_form_text(raw_text)
             st.session_state.dados = extracted_data
 
             if any(extracted_data.values()):
@@ -120,50 +114,33 @@ if uploaded:
             st.error("Ocorreu um erro crítico ao processar o arquivo.")
             st.session_state.full_text_debug = traceback.format_exc()
 
-# ----------------------------------------------------------
-# INTERFACE DO FORMULÁRIO (RENDERIZAÇÃO)
-# ----------------------------------------------------------
+# --- INTERFACE DO FORMULÁRIO (RENDERIZAÇÃO) ---
 def get_value(field, default=""):
-    # Esta função agora preenche os campos do formulário com os dados extraídos
     return st.session_state.dados.get(field, default)
 
 st.markdown("---")
 st.markdown("### 👤 Dados do Paciente")
 
 col1, col2 = st.columns(2)
-with col1:
-    st.text_input("Nome do Paciente", get_value("nome_paciente"), key="nome_paciente")
-with col2:
-    st.text_input("Nome da Mãe", get_value("nome_genitora"), key="nome_genitora")
-# ... O resto do formulário continua o mesmo ...
-col3, col4 = st.columns(2)
-with col3:
-    st.text_input("CNS (Cartão SUS)", get_value("cartao_sus"), key="cartao_sus")
-with col4:
-    st.text_input("Data de Nascimento", get_value("data_nascimento"), key="data_nascimento")
-col5, col6 = st.columns(2)
+with col1: st.text_input("Nome do Paciente", get_value("nome_paciente"), key="nome_paciente")
+with col2: st.text_input("Nome da Mãe", get_value("nome_genitora"), key="nome_genitora")
+col3, col4 = st.columns(2); col5, col6 = st.columns(2); col7, col8 = st.columns(2)
+with col3: st.text_input("CNS (Cartão SUS)", get_value("cartao_sus"), key="cartao_sus")
+with col4: st.text_input("Data de Nascimento", get_value("data_nascimento"), key="data_nascimento")
 with col5:
-    sexo_options = ["", "Feminino", "Masculino"]
-    sexo_val = get_value("sexo", "")
+    sexo_options = ["", "Feminino", "Masculino"]; sexo_val = get_value("sexo", "")
     sexo_idx = sexo_options.index(sexo_val) if sexo_val in sexo_options else 0
     st.selectbox("Sexo", sexo_options, index=sexo_idx, key="sexo")
-with col6:
-    st.text_input("Raça/Cor", get_value("raca"), key="raca")
-col7, col8 = st.columns(2)
-with col7:
-    st.text_input("Telefone de Contato", get_value("telefone_paciente"), key="telefone_paciente")
-with col8:
-    st.text_input("Nº Prontuário", get_value("prontuario"), key="prontuario")
+with col6: st.text_input("Raça/Cor", get_value("raca"), key="raca")
+with col7: st.text_input("Telefone de Contato", get_value("telefone_paciente"), key="telefone_paciente")
+with col8: st.text_input("Nº Prontuário", get_value("prontuario"), key="prontuario")
 st.markdown("---")
 st.markdown("### 📍 Endereço")
 st.text_area("Endereço Completo", get_value("endereco_completo"), key="endereco_completo", height=80)
 col9, col10, col11 = st.columns([2, 1, 1])
-with col9:
-    st.text_input("Município", get_value("municipio_referencia"), key="municipio_referencia")
-with col10:
-    st.text_input("UF", get_value("uf"), key="uf", max_chars=2)
-with col11:
-    st.text_input("CEP", get_value("cep"), key="cep")
+with col9: st.text_input("Município", get_value("municipio_referencia"), key="municipio_referencia")
+with col10: st.text_input("UF", get_value("uf"), key="uf", max_chars=2)
+with col11: st.text_input("CEP", get_value("cep"), key="cep")
 st.markdown("---")
 st.markdown("### 🩺 Dados Clínicos")
 st.text_area("Diagnóstico Inicial", get_value("diagnostico"), key="diagnostico", height=100)
