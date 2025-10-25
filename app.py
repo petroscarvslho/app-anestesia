@@ -4,6 +4,7 @@ import streamlit as st
 import fitz  # PyMuPDF
 import traceback
 from rapidocr_onnxruntime import RapidOCR
+from PIL import Image, ImageOps, ExifTags
 
 # --- CONFIGURAÇÃO E FUNÇÕES AUXILIARES ---
 st.set_page_config(page_title="Analisador de Laudo AIH", layout="centered")
@@ -15,53 +16,25 @@ def limpar_texto(txt: str) -> str:
 def so_digitos(txt: str) -> str:
     return re.sub(r"\D", "", txt or "")
 
-# --- "MOTOR" DE ANÁLISE DE TEXTO PARA PDF (PRECISO) ---
+# --- "MOTORES" DE ANÁLISE DE TEXTO (NÃO MUDAM) ---
 def parse_pdf_text(full_text: str):
     data = {}
-    patterns = {
-        "nome_paciente": r"Nome do Paciente\s+([A-ZÀ-ÿ\s]+?)\s+CNS",
-        "cartao_sus": r"CNS\s+(\d{15})\s+",
-        "nome_genitora": r"Nome da Mãe\s+([A-ZÀ-ÿ\s]+?)\s+Endereço Residencial",
-        "data_nascimento": r"Data de Nasc\s+([\d/]+)\s+Sexo",
-        "sexo": r"Sexo\s+(Feminino|Masculino)\s+Raça/cor",
-        "raca": r"Raça/cor\s+([A-ZÀ-ÿ]+)\s+Nome do Responsável",
-        "telefone_paciente": r"Telefone de Contato\s+([()\d\s-]+?)\s+Telefone Celular",
-        "prontuario": r"Núm\. Prontuário\s+(\d+)\s+Telefone de Contato",
-        "endereco_completo": r"Endereço Residencial \(Rua, Av etc\)\s+(.*?)\s+CPF",
-        "municipio_referencia": r"Municipio de Referência\s+([A-ZÀ-ÿ\s]+?)\s+Cód\. IBGE",
-        "uf": r"UF\s+([A-Z]{2})\s+CEP",
-        "cep": r"CEP\s+([\d.-]+?)\s+Diretor Clinico",
-        "diagnostico": r"Diagnóstico Inicial\s+(.*?)\s+CID 10 Principal",
-    }
+    patterns = { "nome_paciente": r"Nome do Paciente\s+([A-ZÀ-ÿ\s]+?)\s+CNS", "cartao_sus": r"CNS\s+(\d{15})\s+", "nome_genitora": r"Nome da Mãe\s+([A-ZÀ-ÿ\s]+?)\s+Endereço Residencial", "data_nascimento": r"Data de Nasc\s+([\d/]+)\s+Sexo", "sexo": r"Sexo\s+(Feminino|Masculino)\s+Raça/cor", "raca": r"Raça/cor\s+([A-ZÀ-ÿ]+)\s+Nome do Responsável", "telefone_paciente": r"Telefone de Contato\s+([()\d\s-]+?)\s+Telefone Celular", "prontuario": r"Núm\. Prontuário\s+(\d+)\s+Telefone de Contato", "endereco_completo": r"Endereço Residencial \(Rua, Av etc\)\s+(.*?)\s+CPF", "municipio_referencia": r"Municipio de Referência\s+([A-ZÀ-ÿ\s]+?)\s+Cód\. IBGE", "uf": r"UF\s+([A-Z]{2})\s+CEP", "cep": r"CEP\s+([\d.-]+?)\s+Diretor Clinico", "diagnostico": r"Diagnóstico Inicial\s+(.*?)\s+CID 10 Principal", }
     for field, pattern in patterns.items():
         match = re.search(pattern, full_text, re.IGNORECASE)
         if match: data[field] = limpar_texto(match.group(1))
-            
     if data.get("cartao_sus"): data["cartao_sus"] = so_digitos(data["cartao_sus"])
     if data.get("cep"): data["cep"] = so_digitos(data["cep"])
     return data
 
-# --- "MOTOR" DE ANÁLISE DE TEXTO PARA OCR (ROBUSTO E FLEXÍVEL) ---
 def parse_ocr_text(full_text: str):
     data = {}
-    # Regras que não dependem tanto de espaços perfeitos
-    patterns = {
-        "nome_paciente": r"Paciente\s*([A-Z\s]+?)\s*CNS",
-        "cartao_sus": r"CNS\s*(\d{15})",
-        "nome_genitora": r"Mae\s*([A-Z\s]+?)\s*Feminino|Mae\s*([A-Z\s]+?)\s*Endereco",
-        "data_nascimento": r"Nasc\s*([\d/]+)",
-        "sexo": r"(Feminino|Masculino)",
-        "raca": r"Raca/cor\s*([A-Z]+)",
-        "telefone_paciente": r"\((\d{2})\)\s?(\d{4,5}-\d{4})",
-        "prontuario": r"Prontuario\s*(\d+)",
-        "diagnostico": r"DiagnosticoInicial\s*(.*?)\s*CID",
-    }
+    patterns = { "nome_paciente": r"Paciente\s*([A-Z\s]+?)\s*CNS", "cartao_sus": r"CNS\s*(\d{15})", "nome_genitora": r"Mae\s*([A-Z\s]+?)\s*Feminino|Mae\s*([A-Z\s]+?)\s*Endereco", "data_nascimento": r"Nasc\s*([\d/]+)", "sexo": r"(Feminino|Masculino)", "raca": r"Raca/cor\s*([A-Z]+)", "telefone_paciente": r"\((\d{2})\)\s?(\d{4,5}-?\d{4})", "prontuario": r"Prontuario\s*(\d+)", "diagnostico": r"Diagnostico\s*Inicial\s*(.*?)\s*CID", }
     for field, pattern in patterns.items():
         match = re.search(pattern, full_text, re.IGNORECASE)
         if match:
             value = next((g for g in match.groups() if g is not None), None)
             if value: data[field] = limpar_texto(value)
-
     if data.get("cartao_sus"): data["cartao_sus"] = so_digitos(data["cartao_sus"])
     return data
 
@@ -75,15 +48,56 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     full_text = " ".join(page.get_text(sort=True) for page in doc)
     return re.sub(r'\s+', ' ', full_text).strip()
 
+# === INÍCIO DA MODIFICAÇÃO CIRÚRGICA ===
+def preprocess_image_for_ocr(image_bytes: bytes) -> bytes:
+    """Aplica as melhorias seguras (sem OpenCV) na imagem antes do OCR."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # Estratégia 1: Autorotação a partir dos dados da imagem (EXIF)
+        try:
+            for orientation in ExifTags.TAGS.keys():
+                if ExifTags.TAGS[orientation] == 'Orientation':
+                    break
+            exif = dict(img._getexif().items())
+
+            if exif[orientation] == 3: img = img.rotate(180, expand=True)
+            elif exif[orientation] == 6: img = img.rotate(270, expand=True)
+            elif exif[orientation] == 8: img = img.rotate(90, expand=True)
+        except (AttributeError, KeyError, IndexError):
+            # Imagem não tem dados de orientação
+            pass
+
+        # Estratégia 2: Converter para Tons de Cinza
+        img = ImageOps.grayscale(img)
+
+        # Estratégia 3: Aumentar o Contraste
+        img = ImageOps.autocontrast(img)
+
+        # Salva a imagem processada em memória para enviar ao OCR
+        output_bytes = io.BytesIO()
+        img.save(output_bytes, format='PNG')
+        return output_bytes.getvalue()
+    
+    except Exception:
+        # Se algo der errado, usa a imagem original
+        return image_bytes
+
 def extract_text_from_image(image_bytes: bytes) -> str:
+    # Passo 1: Limpa a imagem antes de ler
+    processed_image_bytes = preprocess_image_for_ocr(image_bytes)
+    
+    # Passo 2: Roda o OCR na imagem limpa
     ocr = get_ocr_model()
-    result, _ = ocr(image_bytes)
+    result, _ = ocr(processed_image_bytes)
     if not result: return ""
-    # Junta o texto do OCR em uma linha única, removendo espaços para corresponder ao padrão "sujo"
+    
+    # Passo 3: Tenta reinserir espaços no texto "colado"
     full_text = "".join([item[1] for item in result])
-    # Adiciona espaços antes de palavras que começam com maiúscula para ajudar a separar
-    full_text = re.sub(r"([A-Z][a-z]+)", r" \1", full_text).strip()
-    return full_text
+    full_text_spaced = re.sub(r"([A-Z][a-z]+)", r" \1", full_text)
+    full_text_spaced = re.sub(r"([A-Z]{2,})", r" \1", full_text_spaced)
+    return re.sub(r'\s+', ' ', full_text_spaced).strip()
+# === FIM DA MODIFICAÇÃO CIRÚRGICA ===
 
 # --- LÓGICA PRINCIPAL DO APLICATIVO ---
 if "dados" not in st.session_state: st.session_state.dados = {}
