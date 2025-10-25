@@ -1,15 +1,14 @@
 import io
 import re
-from datetime import datetime, date, time
 import streamlit as st
 import fitz  # PyMuPDF
 import traceback
 from rapidocr_onnxruntime import RapidOCR
 
 # ----------------------------------------------------------
-# CONFIGURAÇÃO DA PÁGINA E CSS
+# CONFIGURAÇÃO DA PÁGINA E CSS (NÃO MUDA)
 # ----------------------------------------------------------
-st.set_page_config(page_title="Gerador de Ficha HEMOBA", layout="centered")
+st.set_page_config(page_title="Analisador de Laudo AIH", layout="centered")
 MOBILE_CSS = """
 <style>
 .block-container {max-width: 740px !important; padding-top: 1.2rem;} h1,h2 { letter-spacing: -0.3px; } h3 { margin-top: 1.2rem; } .badge {display:inline-flex; align-items:center; gap:.4rem; font-size:.8rem; padding:.15rem .5rem; border-radius:999px; background:#eef2ff; color:#274 ; border:1px solid #dbeafe;} .badge .dot {width:.55rem;height:.55rem;border-radius:50%;} .dot-aih {background:#3b82f6;} .dot-ocr {background:#22c55e;} .dot-man {background:#cbd5e1;} .stTextInput > div > div > input, .stTextArea textarea { font-size: 16px !important; } label {font-weight:600} hr { border:none; height:1px; background:#eee; margin: 1.2rem 0;}
@@ -18,7 +17,7 @@ MOBILE_CSS = """
 st.markdown(MOBILE_CSS, unsafe_allow_html=True)
 
 # ----------------------------------------------------------
-# FUNÇÕES AUXILIARES DE LIMPEZA
+# FUNÇÕES AUXILIARES DE LIMPEZA (NÃO MUDAM)
 # ----------------------------------------------------------
 def limpar_texto(txt: str) -> str:
     if not txt: return ""
@@ -28,7 +27,7 @@ def so_digitos(txt: str) -> str:
     return re.sub(r"\D", "", txt or "")
 
 # ----------------------------------------------------------
-# O "MOTOR" DE ANÁLISE DE TEXTO (PARA PDF E IMAGEM)
+# O "MOTOR" DE ANÁLISE DE TEXTO (REGRAS VALIDADAS)
 # ----------------------------------------------------------
 def parse_form_text(full_text: str):
     data = {}
@@ -60,15 +59,23 @@ def parse_form_text(full_text: str):
     return data
 
 # ----------------------------------------------------------
-# FUNÇÕES EXTRATORAS DE TEXTO (UMA PARA CADA TIPO DE ARQUIVO)
+# FUNÇÕES EXTRATORAS DE TEXTO (NOVA LÓGICA PARA PDF)
 # ----------------------------------------------------------
 @st.cache_resource
 def get_ocr_model():
     return RapidOCR()
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """
+    NOVA VERSÃO: Lê o PDF em blocos e os ordena para respeitar o layout visual,
+    evitando que o texto fique embaralhado.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    full_text = " ".join(page.get_text("text", flags=fitz.TEXTFLAGS_SEARCH).replace('\n', ' ') for page in doc)
+    full_text = ""
+    for page in doc:
+        # Pega os blocos de texto e os ordena de cima para baixo
+        blocks = sorted(page.get_text("blocks"), key=lambda b: b[1])
+        full_text += " ".join(block[4].replace('\n', ' ').strip() for block in blocks)
     return re.sub(r'\s+', ' ', full_text).strip()
 
 def extract_text_from_image(image_bytes: bytes) -> str:
@@ -79,7 +86,7 @@ def extract_text_from_image(image_bytes: bytes) -> str:
     return re.sub(r'\s+', ' ', full_text).strip()
 
 # ----------------------------------------------------------
-# LÓGICA PRINCIPAL DO APLICATIVO
+# LÓGICA PRINCIPAL DO APLICATIVO (SEM st.rerun())
 # ----------------------------------------------------------
 if "dados" not in st.session_state: st.session_state.dados = {}
 if "full_text_debug" not in st.session_state: st.session_state.full_text_debug = "Nenhum arquivo carregado."
@@ -105,7 +112,6 @@ if uploaded:
 
             if any(extracted_data.values()):
                 st.success("✅ Documento analisado com sucesso!")
-                st.rerun()
             else:
                 st.warning("⚠️ Arquivo lido, mas nenhum dado foi extraído. Verifique o texto de debug.")
         
@@ -121,12 +127,13 @@ def get_value(field, default=""):
 
 st.markdown("---")
 st.markdown("### 👤 Dados do Paciente")
-# ... (o resto do formulário continua idêntico)
+
 col1, col2 = st.columns(2)
 with col1:
     st.text_input("Nome do Paciente", get_value("nome_paciente"), key="nome_paciente")
 with col2:
     st.text_input("Nome da Mãe", get_value("nome_genitora"), key="nome_genitora")
+# ... O resto do formulário continua o mesmo ...
 col3, col4 = st.columns(2)
 with col3:
     st.text_input("CNS (Cartão SUS)", get_value("cartao_sus"), key="cartao_sus")
