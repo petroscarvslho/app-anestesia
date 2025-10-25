@@ -574,7 +574,7 @@ if uploaded:
     
     # CORREÇÃO: Forçar o Streamlit a recriar os widgets do formulário
     # para que eles usem os novos valores de st.session_state.dados
-    st.experimental_rerun()
+    st.rerun()
 
 # Helper para badges
 def badge(field):
