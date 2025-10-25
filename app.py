@@ -570,8 +570,11 @@ if uploaded:
                 st.session_state.dados[key] = value
                 st.session_state.origem_dados[key] = origem
     
-    if extracted:
-        st.success(f"✅ Dados extraídos com sucesso via {origem}!")
+    st.success(f"✅ Dados extraídos com sucesso via {origem}!")
+    
+    # CORREÇÃO: Forçar o Streamlit a recriar os widgets do formulário
+    # para que eles usem os novos valores de st.session_state.dados
+    st.experimental_rerun()
 
 # Helper para badges
 def badge(field):
@@ -895,4 +898,3 @@ if st.button("🔽 Gerar PDF da Ficha HEMOBA", type="primary", use_container_wid
 with st.expander("🔍 Ver dados extraídos (debug)"):
     st.json(st.session_state.dados)
     st.json(st.session_state.origem_dados)
-
