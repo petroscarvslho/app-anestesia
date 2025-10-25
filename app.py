@@ -11,7 +11,7 @@ from rapidocr_onnxruntime import RapidOCR
 st.set_page_config(page_title="Analisador de Laudo AIH", layout="centered")
 MOBILE_CSS = """
 <style>
-.block-container {max-width: 740px !important; padding-top: 1.2rem;} h1,h2 { letter-spacing: -0.3px; } h3 { margin-top: 1.2rem; } .badge {display:inline-flex; align-items:center; gap:.4rem; font-size:.8rem; padding:.15rem .5rem; border-radius:999px; background:#eef2ff; color:#274 ; border:1px solid #dbeafe;} .badge .dot {width:.55rem;height:.55rem;border-radius:50%;} .dot-aih {background:#3b82f6;} .dot-ocr {background:#22c55e;} .dot-man {background:#cbd5e1;} .stTextInput > div > div > input, .stTextArea textarea { font-size: 16px !important; } label {font-weight:600} hr { border:none; height:1px; background:#eee; margin: 1.2rem 0;}
+.block-container {max-width: 740px !important; padding-top: 1.2rem;} h1,h2 { letter-spacing: -0.3px; } h3 { margin-top: 1.2rem; }
 </style>
 """
 st.markdown(MOBILE_CSS, unsafe_allow_html=True)
@@ -27,10 +27,11 @@ def so_digitos(txt: str) -> str:
     return re.sub(r"\D", "", txt or "")
 
 # ----------------------------------------------------------
-# O "MOTOR" DE ANÁLISE DE TEXTO (REGRAS VALIDADAS)
+# O "MOTOR" DE ANÁLISE DE TEXTO (REGRAS AJUSTADAS)
 # ----------------------------------------------------------
 def parse_form_text(full_text: str):
     data = {}
+    # Regras ajustadas para serem mais robustas com o texto ordenado
     patterns = {
         "nome_paciente": r"Nome do Paciente\s+([A-ZÀ-ÿ\s]+?)\s+CNS",
         "cartao_sus": r"CNS\s+(\d{15})\s+",
@@ -59,7 +60,7 @@ def parse_form_text(full_text: str):
     return data
 
 # ----------------------------------------------------------
-# FUNÇÕES EXTRATORAS DE TEXTO (NOVA LÓGICA PARA PDF)
+# FUNÇÕES EXTRATORAS DE TEXTO (MUDANÇA CRÍTICA AQUI!)
 # ----------------------------------------------------------
 @st.cache_resource
 def get_ocr_model():
@@ -67,21 +68,21 @@ def get_ocr_model():
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """
-    NOVA VERSÃO: Lê o PDF em blocos e os ordena para respeitar o layout visual,
-    evitando que o texto fique embaralhado.
+    VERSÃO CORRIGIDA: Usa o método 'sort=True' do PyMuPDF, que organiza o texto
+    em uma ordem de leitura natural (de cima para baixo, esquerda para a direita).
+    Isso evita o embaralhamento de palavras.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     full_text = ""
     for page in doc:
-        # Pega os blocos de texto e os ordena de cima para baixo
-        blocks = sorted(page.get_text("blocks"), key=lambda b: b[1])
-        full_text += " ".join(block[4].replace('\n', ' ').strip() for block in blocks)
+        full_text += page.get_text(sort=True) + " "
     return re.sub(r'\s+', ' ', full_text).strip()
 
 def extract_text_from_image(image_bytes: bytes) -> str:
     ocr = get_ocr_model()
     result, _ = ocr(image_bytes)
     if not result: return ""
+    # Junta o resultado do OCR em uma linha única, que é como o extrator de PDF agora funciona
     full_text = " ".join([item[1] for item in result])
     return re.sub(r'\s+', ' ', full_text).strip()
 
@@ -123,6 +124,7 @@ if uploaded:
 # INTERFACE DO FORMULÁRIO (RENDERIZAÇÃO)
 # ----------------------------------------------------------
 def get_value(field, default=""):
+    # Esta função agora preenche os campos do formulário com os dados extraídos
     return st.session_state.dados.get(field, default)
 
 st.markdown("---")
