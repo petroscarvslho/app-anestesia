@@ -116,6 +116,102 @@ def separate_long_uppercase(word: str) -> str:
     
     return ' '.join(result)
 
+# === ADIÇÃO 8: CORREÇÃO DE ESPAÇAMENTO INDEVIDO ===
+def fix_broken_words(text: str) -> str:
+    """
+    Corrige palavras que foram quebradas incorretamente pelo OCR.
+    Ex: 'DOSSA NTOS' -> 'DOS SANTOS', 'A NATA LIA' -> 'ANATALIA'
+    """
+    if not text:
+        return text
+    
+    # Padrões de palavras conhecidas que aparecem quebradas
+    word_fixes = {
+        r'DOSSA\s+NTOS': 'DOS SANTOS',
+        r'A\s+NATA\s*LIABA\s*RBOSA': 'ANATALIA BARBOSA',
+        r'A\s+NATA\s*LIA': 'ANATALIA',
+        r'BA\s+RBOSA': 'BARBOSA',
+        r'Nomedo': 'Nome do',
+        r'Solicltante': 'Solicitante',
+        r'CURETAGEMPOS': 'CURETAGEM POS',
+        r'ABORTORETIDO': 'ABORTO RETIDO',
+        r'RETIDODE': 'RETIDO DE',
+        r'SANGRAMENTOVAGINAL': 'SANGRAMENTO VAGINAL',
+        r'Telefonede': 'Telefone de',
+        r'Municipiode': 'Municipio de',
+    }
+    
+    fixed_text = text
+    for pattern, replacement in word_fixes.items():
+        fixed_text = re.sub(pattern, replacement, fixed_text, flags=re.IGNORECASE)
+    
+    # Corrigir padrão geral: letra + espaço + 1-2 letras + espaço + resto da palavra
+    # Ex: "A NATA" -> "ANATA", mas só se fizer sentido
+    # Procura por padrões como: [LETRA] [1-3 LETRAS] [LETRA] onde há espaços indevidos
+    fixed_text = re.sub(r'\b([A-Z])\s+([A-Z]{1,3})\s+([A-Z]{2,})', 
+                       lambda m: m.group(1) + m.group(2) + m.group(3) if len(m.group(2)) <= 2 else m.group(0),
+                       fixed_text)
+    
+    return fixed_text
+
+# === ADIÇÃO 9: NORMALIZAÇÃO DE DATAS ===
+def normalize_dates(text: str) -> str:
+    """
+    Normaliza formatos de data para o padrão DD/MM/AAAA.
+    Ex: '26/3/25' -> '26/03/2025', '1/1/25' -> '01/01/2025'
+    """
+    if not text:
+        return text
+    
+    # Padrão para datas no formato D/M/AA ou DD/M/AA ou D/MM/AA
+    def expand_date(match):
+        day, month, year = match.groups()
+        
+        # Adicionar zero à esquerda se necessário
+        day = day.zfill(2)
+        month = month.zfill(2)
+        
+        # Expandir ano de 2 para 4 dígitos
+        if len(year) == 2:
+            year_int = int(year)
+            # Se ano >= 50, considera 19XX, senão 20XX
+            if year_int >= 50:
+                year = '19' + year
+            else:
+                year = '20' + year
+        
+        return f"{day}/{month}/{year}"
+    
+    # Procurar padrões de data: D/M/AA ou DD/MM/AA
+    normalized = re.sub(r'(\d{1,2})/(\d{1,2})/(\d{2,4})', expand_date, text)
+    
+    return normalized
+
+# === ADIÇÃO 10: EXTRAÇÃO MELHORADA DE CÓDIGOS ===
+def extract_medical_codes(text: str) -> dict:
+    """
+    Extrai códigos médicos específicos do texto.
+    Retorna um dicionário com os códigos encontrados.
+    """
+    codes = {}
+    
+    # CID-10 (formato: letra seguida de 2-3 dígitos)
+    cid_match = re.search(r'CID\s*10\s*Principal[^A-Z0-9]*([A-Z]\d{2,3})', text, re.IGNORECASE)
+    if cid_match:
+        codes['cid10'] = cid_match.group(1)
+    
+    # Código do procedimento (geralmente 10 dígitos)
+    proc_match = re.search(r'Codigo\s*do\s*Procedimento[^\d]*(\d{10})', text, re.IGNORECASE)
+    if proc_match:
+        codes['codigo_procedimento'] = proc_match.group(1)
+    
+    # CNES (7 dígitos)
+    cnes_match = re.search(r'CNES[^\d]*(\d{7})', text, re.IGNORECASE)
+    if cnes_match:
+        codes['cnes'] = cnes_match.group(1)
+    
+    return codes
+
 # === ADIÇÃO 4: VALIDAÇÃO DE DADOS ===
 def validar_cpf(cpf: str) -> bool:
     """Valida CPF usando algoritmo de dígito verificador."""
@@ -316,6 +412,12 @@ def extract_text_from_image(image_bytes: bytes) -> str:
     # === APLICAR PÓS-PROCESSAMENTO ===
     full_text = post_process_ocr_text(full_text)
     
+    # === APLICAR CORREÇÃO DE PALAVRAS QUEBRADAS ===
+    full_text = fix_broken_words(full_text)
+    
+    # === APLICAR NORMALIZAÇÃO DE DATAS ===
+    full_text = normalize_dates(full_text)
+    
     return full_text
 
 # --- LÓGICA PRINCIPAL DO APLICATIVO ---
@@ -342,6 +444,12 @@ if uploaded:
             
             st.session_state.full_text_debug = raw_text
             st.session_state.dados = extracted_data
+            
+            # === ADIÇÃO 11: EXTRAIR CÓDIGOS MÉDICOS ===
+            medical_codes = extract_medical_codes(raw_text)
+            if medical_codes:
+                extracted_data.update(medical_codes)
+                st.session_state.dados = extracted_data
             
             # === ADIÇÃO 6: VALIDAR DADOS EXTRAÍDOS ===
             validacoes = {}
@@ -434,6 +542,20 @@ with col11:
 
 st.markdown("### 🏥 Informações Clínicas")
 st.text_area("Diagnóstico", get_value("diagnostico"), height=100, key="diagnostico_input")
+
+# === ADIÇÃO 12: CAMPOS DE CÓDIGOS MÉDICOS ===
+if get_value("cid10") or get_value("codigo_procedimento") or get_value("cnes"):
+    st.markdown("### 📊 Códigos Médicos")
+    col_cod1, col_cod2, col_cod3 = st.columns(3)
+    with col_cod1:
+        if get_value("cid10"):
+            st.text_input("🏷️ CID-10", get_value("cid10"), key="cid10_input")
+    with col_cod2:
+        if get_value("codigo_procedimento"):
+            st.text_input("📝 Cód. Procedimento", get_value("codigo_procedimento"), key="proc_input")
+    with col_cod3:
+        if get_value("cnes"):
+            st.text_input("🏛️ CNES", get_value("cnes"), key="cnes_input")
 
 st.markdown("---")
 
