@@ -348,6 +348,212 @@ def parse_ocr_text(full_text: str):
 def get_ocr_model():
     return RapidOCR()
 
+# === ADIÇÃO 13: CORREÇÃO DE PERSPECTIVA ===
+def correct_perspective(image: np.ndarray) -> np.ndarray:
+    """
+    Detecta e corrige perspectiva de documentos fotografados de ângulo.
+    Encontra os 4 cantos do documento e aplica transformação de perspectiva.
+    """
+    try:
+        # Criar cópia para não modificar original
+        img_copy = image.copy()
+        
+        # Detectar bordas
+        edges = cv2.Canny(img_copy, 50, 150)
+        
+        # Encontrar contornos
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return image
+        
+        # Pegar o maior contorno (provavelmente o documento)
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        # Aproximar o contorno para um polígono
+        epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+        approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+        
+        # Se encontrou 4 pontos (retângulo), aplicar transformação
+        if len(approx) == 4:
+            # Ordenar pontos: top-left, top-right, bottom-right, bottom-left
+            pts = approx.reshape(4, 2)
+            rect = np.zeros((4, 2), dtype="float32")
+            
+            # Somar coordenadas: top-left terá menor soma, bottom-right maior
+            s = pts.sum(axis=1)
+            rect[0] = pts[np.argmin(s)]
+            rect[2] = pts[np.argmax(s)]
+            
+            # Diferença: top-right terá menor diferença, bottom-left maior
+            diff = np.diff(pts, axis=1)
+            rect[1] = pts[np.argmin(diff)]
+            rect[3] = pts[np.argmax(diff)]
+            
+            # Calcular largura e altura do documento corrigido
+            (tl, tr, br, bl) = rect
+            widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+            widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+            maxWidth = max(int(widthA), int(widthB))
+            
+            heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+            heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+            maxHeight = max(int(heightA), int(heightB))
+            
+            # Pontos de destino
+            dst = np.array([
+                [0, 0],
+                [maxWidth - 1, 0],
+                [maxWidth - 1, maxHeight - 1],
+                [0, maxHeight - 1]], dtype="float32")
+            
+            # Calcular matriz de transformação e aplicar
+            M = cv2.getPerspectiveTransform(rect, dst)
+            warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+            
+            return warped
+        
+        return image
+    except Exception:
+        return image
+
+# === ADIÇÃO 14: AJUSTE AUTOMÁTICO DE BRILHO E CONTRASTE ===
+def auto_adjust_brightness_contrast(image: np.ndarray) -> np.ndarray:
+    """
+    Ajusta automaticamente brilho e contraste da imagem.
+    Útil para fotos escuras ou com pouca luz.
+    """
+    try:
+        # Aplicar equalização de histograma adaptativa (CLAHE)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(image)
+        
+        # Ajuste adicional de contraste
+        # Calcular valores mínimo e máximo
+        min_val = np.percentile(enhanced, 2)
+        max_val = np.percentile(enhanced, 98)
+        
+        # Normalizar entre 0 e 255
+        if max_val > min_val:
+            enhanced = np.clip((enhanced - min_val) * (255.0 / (max_val - min_val)), 0, 255).astype(np.uint8)
+        
+        return enhanced
+    except Exception:
+        return image
+
+# === ADIÇÃO 15: UPSCALING DE IMAGEM ===
+def upscale_image(image: np.ndarray, scale_factor: float = 2.0) -> np.ndarray:
+    """
+    Aumenta a resolução da imagem usando interpolação de alta qualidade.
+    Útil para fotos pequenas ou de baixa resolução.
+    """
+    try:
+        height, width = image.shape[:2]
+        
+        # Só fazer upscale se a imagem for pequena (menor que 1500px)
+        if width < 1500 or height < 1500:
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+            
+            # Usar interpolação cúbica para melhor qualidade
+            upscaled = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+            
+            # Aplicar sharpening leve para melhorar nitidez
+            kernel = np.array([[-1,-1,-1],
+                             [-1, 9,-1],
+                             [-1,-1,-1]])
+            sharpened = cv2.filter2D(upscaled, -1, kernel)
+            
+            # Mesclar 70% sharpened + 30% upscaled para não exagerar
+            result = cv2.addWeighted(sharpened, 0.7, upscaled, 0.3, 0)
+            
+            return result
+        
+        return image
+    except Exception:
+        return image
+
+# === ADIÇÃO 16: DETECÇÃO E RECORTE DE BORDAS ===
+def detect_and_crop_document(image: np.ndarray) -> np.ndarray:
+    """
+    Detecta as bordas do documento e recorta apenas a área relevante.
+    Remove fundos desnecessários.
+    """
+    try:
+        # Aplicar blur para reduzir ruído
+        blurred = cv2.GaussianBlur(image, (5, 5), 0)
+        
+        # Detectar bordas
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # Dilatar para conectar bordas próximas
+        kernel = np.ones((5, 5), np.uint8)
+        dilated = cv2.dilate(edges, kernel, iterations=2)
+        
+        # Encontrar contornos
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            # Pegar o maior contorno
+            largest_contour = max(contours, key=cv2.contourArea)
+            
+            # Pegar bounding box
+            x, y, w, h = cv2.boundingRect(largest_contour)
+            
+            # Adicionar margem de 2%
+            margin = int(min(w, h) * 0.02)
+            x = max(0, x - margin)
+            y = max(0, y - margin)
+            w = min(image.shape[1] - x, w + 2 * margin)
+            h = min(image.shape[0] - y, h + 2 * margin)
+            
+            # Recortar
+            cropped = image[y:y+h, x:x+w]
+            
+            # Só retornar se o recorte for significativo (> 50% da imagem original)
+            if cropped.size > image.size * 0.5:
+                return cropped
+        
+        return image
+    except Exception:
+        return image
+
+# === ADIÇÃO 17: VALIDAÇÃO DE QUALIDADE DA IMAGEM ===
+def assess_image_quality(image: np.ndarray) -> dict:
+    """
+    Avalia a qualidade da imagem e retorna métricas.
+    """
+    quality = {
+        'is_blurry': False,
+        'is_too_dark': False,
+        'is_too_bright': False,
+        'is_low_resolution': False,
+        'blur_score': 0,
+        'brightness': 0,
+        'resolution': (0, 0)
+    }
+    
+    try:
+        # Verificar resolução
+        height, width = image.shape[:2]
+        quality['resolution'] = (width, height)
+        quality['is_low_resolution'] = width < 800 or height < 800
+        
+        # Verificar blur (usando variância do Laplaciano)
+        laplacian_var = cv2.Laplacian(image, cv2.CV_64F).var()
+        quality['blur_score'] = laplacian_var
+        quality['is_blurry'] = laplacian_var < 100  # Threshold empírico
+        
+        # Verificar brilho
+        brightness = np.mean(image)
+        quality['brightness'] = brightness
+        quality['is_too_dark'] = brightness < 80
+        quality['is_too_bright'] = brightness > 200
+        
+        return quality
+    except Exception:
+        return quality
+
 def deskew(image: np.ndarray) -> np.ndarray:
     """Função para corrigir a inclinação da imagem."""
     coords = np.column_stack(np.where(image < 255))
@@ -380,6 +586,23 @@ def preprocess_image_for_ocr(image_bytes: bytes) -> bytes:
         
         img_array = np.array(pil_img.convert('RGB'))
         gray_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        
+        # === ADIÇÃO 13: AVALIAR QUALIDADE DA IMAGEM ===
+        quality = assess_image_quality(gray_img)
+        
+        # === ADIÇÃO 15: UPSCALING SE NECESSÁRIO ===
+        if quality['is_low_resolution']:
+            gray_img = upscale_image(gray_img, scale_factor=2.0)
+        
+        # === ADIÇÃO 14: AJUSTAR BRILHO/CONTRASTE SE NECESSÁRIO ===
+        if quality['is_too_dark'] or quality['is_too_bright']:
+            gray_img = auto_adjust_brightness_contrast(gray_img)
+        
+        # === ADIÇÃO 16: DETECTAR E RECORTAR DOCUMENTO ===
+        gray_img = detect_and_crop_document(gray_img)
+        
+        # === ADIÇÃO 13: CORRIGIR PERSPECTIVA ===
+        gray_img = correct_perspective(gray_img)
         
         # === ADIÇÃO 1: REMOÇÃO DE RUÍDO ===
         denoised_img = cv2.fastNlMeansDenoising(gray_img, None, 10, 7, 21)
